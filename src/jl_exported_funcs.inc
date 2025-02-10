@@ -76,7 +76,6 @@
     XX(jl_call_in_typeinf_world) \
     XX(jl_capture_interp_frame) \
     XX(jl_ceil_llvm) \
-    XX(jl_ceil_llvm_withtype) \
     XX(jl_cglobal) \
     XX(jl_cglobal_auto) \
     XX(jl_checked_assignment) \

@@ -87,7 +87,7 @@
     ADD_I(trunc_llvm, 1) \
     ADD_I(rint_llvm, 1) \
     ADD_I(sqrt_llvm, 1) \
-    ADD_I(sqrt_llvm_fast, 1) \
+    ALIAS(sqrt_llvm_fast, sqrt_llvm) \
     /*  pointer arithmetic */ \
     ADD_I(add_ptr, 2) \
     ADD_I(sub_ptr, 2) \
