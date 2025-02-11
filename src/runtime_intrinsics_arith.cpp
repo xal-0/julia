@@ -2,6 +2,7 @@
 #include <functional>
 #include <llvm/ADT/APSInt.h>
 #include <llvm/ADT/ArrayRef.h>
+#include <llvm/ADT/bit.h>
 
 #include "intrinsics.h"
 #include "julia.h"
@@ -48,21 +49,24 @@ struct converter<bool> {
 };
 
 template<>
-struct converter<APSInt> {
-    static jl_value_t *to_value(jl_value_t *ty, const APSInt &x)
+struct converter<APInt> {
+    static jl_value_t *to_value(jl_value_t *ty, const APInt &x)
     {
         jl_task_t *ct = jl_current_task;
         jl_value_t *newv = jl_gc_alloc(ct->ptls, jl_datatype_size(ty), ty);
-        converter<APSInt>::write_value(ty, (char *)jl_data_ptr(newv), x);
+        converter<APInt>::write_value(ty, (char *)jl_data_ptr(newv), x);
         return newv;
     }
 
-    static void write_value(jl_value_t *ty, char *dest, const APSInt &src)
+    static void write_value(jl_value_t *ty, char *dest, const APInt &src)
     {
         // APInt handles big vs little-endian
         StoreIntToMemory(src, (uint8_t *)dest, jl_datatype_size(ty));
     }
+};
 
+template<>
+struct converter<APSInt> : converter<APInt> {
     static APSInt from_value(jl_value_t *x, bool is_unsigned = true)
     {
         unsigned sz = jl_datatype_size(jl_typeof(x));
@@ -145,16 +149,16 @@ using dispatch_signed = dispatch_size<OP, int8_t, int16_t, int32_t, int64_t, fal
 template<template<typename> class OP>
 using dispatch_unsigned = dispatch_size<OP, uint8_t, uint16_t, uint32_t, uint64_t, true>;
 
-// Load a uint32_t or smaller from a jl_value_t, zero-extending if necessary.
-uint32_t load_u32(jl_value_t *x)
+// Version of dispatch_[un]signed that always use APSInt.  It is expected that
+// OP will use the appropriately signed operation, so there is no need to have
+// two versions.
+template<template<typename> class OP>
+using dispatch_slow = dispatch_size<OP, APSInt, APSInt, APSInt, APSInt, true>;
+
+// Load a uint8_t from a primitive jl_value_t (must be at least 1 byte).
+uint8_t load_u8(jl_value_t *x)
 {
-    size_t sz = jl_datatype_size(jl_typeof(x));
-    uint32_t r = 0;
-    if constexpr (BYTE_ORDER == LITTLE_ENDIAN)
-        memcpy(&r, (char *)jl_data_ptr(x), min(sz, sizeof r));
-    else
-        memcpy(&r + sizeof r - sz, (char *)jl_data_ptr(x), min(sz, sizeof r));
-    return r;
+    return *(uint8_t *)jl_data_ptr(x);
 }
 
 // Dispatch on the size of the first argument, zero-extending (or truncating)
@@ -170,13 +174,13 @@ struct dispatch_shift {
         jl_value_t *src_ty = jl_typeof(a);
         unsigned sz = jl_datatype_size(src_ty);
         switch (sz) {
-        case 1: return to_value(dest_ty, OP<T1>()(from_value<uint8_t>(a), load_u32(b)));
-        case 2: return to_value(dest_ty, OP<T2>()(from_value<T2>(a), load_u32(b)));
-        case 4: return to_value(dest_ty, OP<T4>()(from_value<T4>(a), load_u32(b)));
-        case 8: return to_value(dest_ty, OP<T8>()(from_value<T8>(a), load_u32(b)));
+        case 1: return to_value(dest_ty, OP<T1>()(from_value<uint8_t>(a), load_u8(b)));
+        case 2: return to_value(dest_ty, OP<T2>()(from_value<T2>(a), load_u8(b)));
+        case 4: return to_value(dest_ty, OP<T4>()(from_value<T4>(a), load_u8(b)));
+        case 8: return to_value(dest_ty, OP<T8>()(from_value<T8>(a), load_u8(b)));
         default:
-            return to_value(dest_ty,
-                            OP<APSInt>()(from_value<APSInt>(a, is_unsigned), load_u32(b)));
+            return to_value(dest_ty, OP<APSInt>()(from_value<APSInt>(a, is_unsigned),
+                                                  from_value<APSInt>(b, true)));
         }
     }
 };
@@ -212,14 +216,15 @@ struct dispatch_float {
     }
 };
 
-// Templates for intrinsics.  These are class templates so that we can partially
-// specialize them for APSInt or weird floating point types.
+// Templates for intrinsics.  These are class templates so they can be partially
+// specialized for APInt or non-standard floating point types.
 
-// TODO: shift amount greater than bits is undefined behaviour
-// in LLVM?  Check what APInt does.
+// Note that all shifts >= the bit size of the LHS type are UB.  APInt shifts
+// are defined for shift(APInt, APInt), but shift(APInt, unsigned) has the same
+// UB.
 template<typename T>
 struct shl {
-    T operator()(T a, unsigned b)
+    T operator()(T a, uint8_t b)
     {
         if (b >= CHAR_BIT * sizeof(a))
             return T();
@@ -228,24 +233,27 @@ struct shl {
 };
 template<>
 struct shl<APSInt> {
-    APSInt operator()(APSInt a, unsigned b) { return a << b; }
+    APInt operator()(APSInt a, APSInt b) { return a.shl(b); }
 };
+
 template<typename T>
 struct lshr {
-    T operator()(T a, unsigned b)
+    T operator()(T a, uint8_t b)
     {
         if (b >= CHAR_BIT * sizeof(a))
             return T();
         return a >> b;
     }
 };
+
 template<>
 struct lshr<APSInt> {
-    APSInt operator()(APSInt a, unsigned b) { return a >> b; }
+    APInt operator()(APSInt a, APSInt b) { return a.lshr(b); }
 };
+
 template<typename T>
 struct ashr {
-    T operator()(T a, unsigned b)
+    T operator()(T a, uint8_t b)
     {
         if (b < 0 || b >= CHAR_BIT * sizeof(a))
             return a >> (CHAR_BIT * sizeof(a) - 1);
@@ -254,7 +262,7 @@ struct ashr {
 };
 template<>
 struct ashr<APSInt> {
-    APSInt operator()(APSInt a, unsigned b) { return a >> b; }
+    APInt operator()(APSInt a, APSInt b) { return a.ashr(b); }
 };
 
 // TODO: -0.0 vs 0.0
@@ -274,7 +282,7 @@ struct fma_ {
 
 template<typename T>
 struct muladd {
-    T operator()(T a, T b, T c) { return a*b + c; }
+    T operator()(T a, T b, T c) { return a * b + c; }
 };
 
 template<typename T>
@@ -298,10 +306,10 @@ struct checked_sadd {
 };
 template<>
 struct checked_sadd<APSInt> {
-    tuple<APSInt, bool> operator()(APSInt a, APSInt b)
+    tuple<APInt, bool> operator()(APSInt a, APSInt b)
     {
         bool overflow;
-        APSInt r{a.sadd_ov(b, overflow), false};
+        APInt r = a.sadd_ov(b, overflow);
         return {r, overflow};
     }
 };
@@ -317,10 +325,10 @@ struct checked_uadd {
 };
 template<>
 struct checked_uadd<APSInt> {
-    tuple<APSInt, bool> operator()(APSInt a, APSInt b)
+    tuple<APInt, bool> operator()(APSInt a, APSInt b)
     {
         bool overflow;
-        APSInt r{a.uadd_ov(b, overflow), true};
+        APInt r = a.uadd_ov(b, overflow);
         return {r, overflow};
     }
 };
@@ -338,10 +346,10 @@ struct checked_ssub {
 };
 template<>
 struct checked_ssub<APSInt> {
-    tuple<APSInt, bool> operator()(APSInt a, APSInt b)
+    tuple<APInt, bool> operator()(APSInt a, APSInt b)
     {
         bool overflow;
-        APSInt r{a.ssub_ov(b, overflow), false};
+        APInt r = a.ssub_ov(b, overflow);
         return {r, overflow};
     }
 };
@@ -357,10 +365,30 @@ struct checked_usub {
 };
 template<>
 struct checked_usub<APSInt> {
-    tuple<APSInt, bool> operator()(APSInt a, APSInt b)
+    tuple<APInt, bool> operator()(APSInt a, APSInt b)
     {
         bool overflow;
-        APSInt r{a.usub_ov(b, overflow), true};
+        APInt r = a.usub_ov(b, overflow);
+        return {r, overflow};
+    }
+};
+
+template<typename T>
+struct checked_smul {
+    tuple<APInt, bool> operator()(APSInt a, APSInt b)
+    {
+        bool overflow;
+        APInt r = a.smul_ov(b, overflow);
+        return {r, overflow};
+    }
+};
+
+template<typename T>
+struct checked_umul {
+    tuple<APInt, bool> operator()(APSInt a, APSInt b)
+    {
+        bool overflow;
+        APInt r = a.umul_ov(b, overflow);
         return {r, overflow};
     }
 };
@@ -403,6 +431,42 @@ struct rint_ {
 template<typename T>
 struct sqrt_ {
     T operator()(T a) { return sqrt(a); }
+};
+
+template<typename T>
+struct bswap {
+    T operator()(T a) { return llvm::byteswap(a); }
+};
+template<>
+struct bswap<APSInt> {
+    APInt operator()(APSInt a) { return a.byteSwap(); }
+};
+
+template<typename T>
+struct ctpop {
+    T operator()(T a) { return llvm::popcount<T>(a); }
+};
+template<>
+struct ctpop<APSInt> {
+    APInt operator()(APSInt a) { return {a.getBitWidth(), a.popcount()}; }
+};
+
+template<typename T>
+struct ctlz {
+    T operator()(T a) { return llvm::countl_zero(a); }
+};
+template<>
+struct ctlz<APSInt> {
+    APInt operator()(APSInt a) { return {a.getBitWidth(), a.countl_zero()}; }
+};
+
+template<typename T>
+struct cttz {
+    T operator()(T a) { return llvm::countr_zero(a); }
+};
+template<>
+struct cttz<APSInt> {
+    APInt operator()(APSInt a) { return {a.getBitWidth(), a.countr_zero()}; }
 };
 
 // op(T) -> T
@@ -475,12 +539,18 @@ INTRINSIC_1(dispatch_unsigned, not_int, bit_not)
 INTRINSIC_2_ARITH(dispatch_shift_unsigned, shl_int, shl)
 INTRINSIC_2_ARITH(dispatch_shift_unsigned, lshr_int, lshr)
 INTRINSIC_2_ARITH(dispatch_shift_signed, ashr_int, ashr)
+INTRINSIC_1(dispatch_unsigned, bswap_int, bswap)
+INTRINSIC_1(dispatch_unsigned, ctpop_int, ctpop)
+INTRINSIC_1(dispatch_unsigned, ctlz_int, ctlz)
+INTRINSIC_1(dispatch_unsigned, cttz_int, cttz)
 
 // Checked arithmetic
 INTRINSIC_2_ARITH(dispatch_unsigned, checked_sadd_int, checked_sadd)
 INTRINSIC_2_ARITH(dispatch_unsigned, checked_uadd_int, checked_uadd)
 INTRINSIC_2_ARITH(dispatch_unsigned, checked_ssub_int, checked_ssub)
 INTRINSIC_2_ARITH(dispatch_unsigned, checked_usub_int, checked_usub)
+INTRINSIC_2_ARITH(dispatch_slow, checked_smul_int, checked_smul)
+INTRINSIC_2_ARITH(dispatch_slow, checked_umul_int, checked_umul)
 
 // Functions
 INTRINSIC_2_ARITH(dispatch_float, copysign_float, copysign_)

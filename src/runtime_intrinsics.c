@@ -871,116 +871,6 @@ static int jl_##name##nbits(unsigned runtime_nbits, void *pa, void *pb, void *pr
     return CHECK_OP(c_type, a, b);    \
 }
 
-// unary operator generator //
-
-typedef void (*intrinsic_1_t)(unsigned, void*, void*);
-SELECTOR_FUNC(intrinsic_1)
-#define un_iintrinsic(name, u) \
-JL_DLLEXPORT jl_value_t *jl_##name(jl_value_t *a) \
-{ \
-    return jl_iintrinsic_1(a, #name, u##signbitbyte, jl_intrinsiclambda_ty1, name##_list); \
-}
-#define un_iintrinsic_fast(LLVMOP, OP, name, u) \
-un_iintrinsic_ctype(OP, name, 8, u##int##8_t) \
-un_iintrinsic_ctype(OP, name, 16, u##int##16_t) \
-un_iintrinsic_ctype(OP, name, 32, u##int##32_t) \
-un_iintrinsic_ctype(OP, name, 64, u##int##64_t) \
-static const select_intrinsic_1_t name##_list = { \
-    LLVMOP, \
-    jl_##name##8, \
-    jl_##name##16, \
-    jl_##name##32, \
-    jl_##name##64, \
-}; \
-un_iintrinsic(name, u)
-#define un_iintrinsic_slow(LLVMOP, name, u) \
-static const select_intrinsic_1_t name##_list = { \
-    LLVMOP \
-}; \
-un_iintrinsic(name, u)
-
-typedef unsigned (*intrinsic_u1_t)(unsigned, void*);
-SELECTOR_FUNC(intrinsic_u1)
-#define uu_iintrinsic(name, u) \
-JL_DLLEXPORT jl_value_t *jl_##name(jl_value_t *a) \
-{ \
-    return jl_iintrinsic_1(a, #name, u##signbitbyte, jl_intrinsiclambda_u1, name##_list); \
-}
-#define uu_iintrinsic_fast(LLVMOP, OP, name, u) \
-uu_iintrinsic_ctype(OP, name, 8, u##int##8_t) \
-uu_iintrinsic_ctype(OP, name, 16, u##int##16_t) \
-uu_iintrinsic_ctype(OP, name, 32, u##int##32_t) \
-uu_iintrinsic_ctype(OP, name, 64, u##int##64_t) \
-static const select_intrinsic_u1_t name##_list = { \
-    LLVMOP, \
-    jl_##name##8, \
-    jl_##name##16, \
-    jl_##name##32, \
-    jl_##name##64, \
-}; \
-uu_iintrinsic(name, u)
-#define uu_iintrinsic_slow(LLVMOP, name, u) \
-static const select_intrinsic_u1_t name##_list = { \
-    LLVMOP \
-}; \
-uu_iintrinsic(name, u)
-
-static inline
-jl_value_t *jl_iintrinsic_1(jl_value_t *a, const char *name,
-                            char (*getsign)(void*, unsigned),
-                            jl_value_t *(*lambda1)(jl_value_t*, void*, unsigned, unsigned, const void*), const void *list)
-{
-    jl_value_t *ty = jl_typeof(a);
-    if (!jl_is_primitivetype(ty))
-        jl_errorf("%s: value is not a primitive type", name);
-    void *pa = jl_data_ptr(a);
-    unsigned isize = jl_datatype_size(jl_typeof(a));
-    unsigned isize2 = next_power_of_two(isize);
-    unsigned osize = jl_datatype_size(ty);
-    unsigned osize2 = next_power_of_two(osize);
-    if (isize2 > osize2)
-        osize2 = isize2;
-    if (osize2 > isize || isize2 > isize) {
-        /* if needed, round type up to a real c-type and set/clear the unused bits */
-        void *pa2;
-        pa2 = alloca(osize2);
-        /* TODO: this memcpy assumes little-endian,
-         * for big-endian, need to align the copy to the other end */ \
-        memcpy(pa2, pa, isize);
-        memset((char*)pa2 + isize, getsign(pa, isize), osize2 - isize);
-        pa = pa2;
-    }
-    jl_value_t *newv = lambda1(ty, pa, osize, osize2, list);
-    if (ty == (jl_value_t*)jl_bool_type)
-        return *(uint8_t*)jl_data_ptr(newv) & 1 ? jl_true : jl_false;
-    return newv;
-}
-
-static inline jl_value_t *jl_intrinsiclambda_ty1(jl_value_t *ty, void *pa, unsigned osize, unsigned osize2, const void *voidlist)
-{
-    intrinsic_1_t op = select_intrinsic_1(osize2, (const intrinsic_1_t*)voidlist);
-    void *pr = alloca(osize2);
-    op(osize * host_char_bit, pa, pr);
-    return jl_new_bits(ty, pr);
-}
-
-static inline jl_value_t *jl_intrinsiclambda_u1(jl_value_t *ty, void *pa, unsigned osize, unsigned osize2, const void *voidlist)
-{
-    jl_task_t *ct = jl_current_task;
-    intrinsic_u1_t op = select_intrinsic_u1(osize2, (const intrinsic_u1_t*)voidlist);
-    uint64_t cnt = op(osize * host_char_bit, pa);
-    // TODO: the following assume little-endian
-    // for big-endian, need to copy from the other end of cnt
-    if (osize <= sizeof(cnt)) {
-        return jl_new_bits(ty, &cnt);
-    }
-    jl_value_t *newv = jl_gc_alloc(ct->ptls, osize, ty);
-    // perform zext, if needed
-    memset((char*)jl_data_ptr(newv) + sizeof(cnt), 0, osize - sizeof(cnt));
-    memcpy(jl_data_ptr(newv), &cnt, sizeof(cnt));
-    return newv;
-}
-
 // conversion operator
 
 typedef void (*intrinsic_cvt_t)(jl_datatype_t*, void*, jl_datatype_t*, void*);
@@ -1078,23 +968,6 @@ jl_value_t *jl_iintrinsic_2(jl_value_t *a, jl_value_t *b, const char *name,
     return newv;
 }
 
-static inline jl_value_t *jl_intrinsiclambda_checked(jl_value_t *ty, void *pa, void *pb, unsigned sz, unsigned sz2, const void *voidlist)
-{
-    jl_value_t *params[2];
-    params[0] = ty;
-    params[1] = (jl_value_t*)jl_bool_type;
-    jl_datatype_t *tuptyp = (jl_datatype_t*)jl_apply_tuple_type_v(params, 2);
-    JL_GC_PROMISE_ROOTED(tuptyp); // (JL_ALWAYS_LEAFTYPE)
-    jl_task_t *ct = jl_current_task;
-    jl_value_t *newv = jl_gc_alloc(ct->ptls, jl_datatype_size(tuptyp), tuptyp);
-
-    intrinsic_checked_t op = select_intrinsic_checked(sz2, (const intrinsic_checked_t*)voidlist);
-    int ovflw = op(sz * host_char_bit, pa, pb, jl_data_ptr(newv));
-
-    char *ao = (char*)jl_data_ptr(newv) + sz;
-    *ao = (char)ovflw;
-    return newv;
-}
 static inline jl_value_t *jl_intrinsiclambda_checkeddiv(jl_value_t *ty, void *pa, void *pb, unsigned sz, unsigned sz2, const void *voidlist)
 {
     void *pr = alloca(sz2);
@@ -1225,20 +1098,6 @@ double julia_fma(double a, double b, double c) {
     sizeof(a) == sizeof(float) ? fmaf(a, b, c) : fma(a, b, c)
 #endif
 
-// bitwise operators
-//#define bswap_op(a) __builtin_bswap(a)
-//un_iintrinsic_fast(LLVMByteSwap, bswap_op, bswap_int, u)
-un_iintrinsic_slow(LLVMByteSwap, bswap_int, u)
-//#define ctpop_op(a) __builtin_ctpop(a)
-//uu_iintrinsic_fast(LLVMPopcount, ctpop_op, ctpop_int, u)
-uu_iintrinsic_slow(LLVMPopcount, ctpop_int, u)
-//#define ctlz_op(a) __builtin_ctlz(a)
-//uu_iintrinsic_fast(LLVMCountl_zero, ctlz_op, ctlz_int, u)
-uu_iintrinsic_slow(LLVMCountl_zero, ctlz_int, u)
-//#define cttz_op(a) __builtin_cttz(a)
-//uu_iintrinsic_fast(LLVMCountr_zero, cttz_op, cttz_int, u)
-uu_iintrinsic_slow(LLVMCountr_zero, cttz_int, u)
-
 // conversions
 cvt_iintrinsic(LLVMTrunc, trunc_int)
 cvt_iintrinsic(LLVMSExt, sext_int)
@@ -1334,8 +1193,6 @@ cvt_iintrinsic(fpext, fpext)
 #define uTYPEMAX(t)                                             \
     ((t)(8 * sizeof(t) == runtime_nbits                         \
          ? (~((t)0)) : (~(((t)~((t)0)) << runtime_nbits))))
-checked_iintrinsic_slow(LLVMMul_sov, checked_smul_int,  )
-checked_iintrinsic_slow(LLVMMul_uov, checked_umul_int, u)
 
 checked_iintrinsic_div(LLVMDiv_sov, checked_sdiv_int,  )
 checked_iintrinsic_div(LLVMDiv_uov, checked_udiv_int, u)
