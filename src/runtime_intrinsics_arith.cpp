@@ -1312,7 +1312,7 @@ void two_mul(double *abhi, double *ablo, double a, double b)
     *ablo = alo * blohi - (((*abhi - ahi * bhi) - alo * bhi) - ahi * blo) + blolo * alo;
 }
 // Base.issubnormal(::Float64) (Win32's fpclassify seems broken)
-int issubnormal(double d)
+int julia_issubnormal(double d)
 {
     uint64_t y = bitcast_d2u(d);
     return ((y & 0x7ff0000000000000) == 0) & ((y & 0x000fffffffffffff) != 0);
@@ -1329,8 +1329,8 @@ double julia_fma(double a, double b, double c)
 {
     double abhi, ablo, r, s;
     two_mul(&abhi, &ablo, a, b);
-    if (!isfinite(abhi + c) || fabs(abhi) < 2.0041683600089732e-292 || issubnormal(a) ||
-        issubnormal(b)) {
+    if (!isfinite(abhi + c) || fabs(abhi) < 2.0041683600089732e-292 || julia_issubnormal(a) ||
+        julia_issubnormal(b)) {
         int aandbfinite = isfinite(a) && isfinite(b);
         if (!(aandbfinite && isfinite(c)))
             return aandbfinite ? c : abhi + c;
@@ -1339,9 +1339,9 @@ double julia_fma(double a, double b, double c)
         int bias = exponent(a) + exponent(b);
         VDOUBLE c_denorm = ldexp(c, -bias);
         if (isfinite(c_denorm)) {
-            if (issubnormal(a))
+            if (julia_issubnormal(a))
                 a *= 4.503599627370496e15;
-            if (issubnormal(b))
+            if (julia_issubnormal(b))
                 b *= 4.503599627370496e15;
             a = bitcast_u2d((bitcast_d2u(a) & 0x800fffffffffffff) | 0x3ff0000000000000);
             b = bitcast_u2d((bitcast_d2u(b) & 0x800fffffffffffff) | 0x3ff0000000000000);
@@ -1350,7 +1350,7 @@ double julia_fma(double a, double b, double c)
             r = abhi + c;
             s = (fabs(abhi) > fabs(c)) ? (abhi - r + c + ablo) : (c - r + abhi + ablo);
             double sumhi = r + s;
-            if (issubnormal(ldexp(sumhi, bias))) {
+            if (julia_issubnormal(ldexp(sumhi, bias))) {
                 double sumlo = r - sumhi + s;
                 int bits_lost = -bias - exponent(sumhi) - 1022;
                 if ((bits_lost != 1) ^ ((bitcast_d2u(sumhi) & 1) == 1))
