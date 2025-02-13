@@ -76,10 +76,9 @@ template<>
 struct converter<APInt> {
     static jl_value_t *to_value(jl_value_t *ty, const APInt &x)
     {
-        jl_task_t *ct = jl_current_task;
-        jl_value_t *newv = jl_gc_alloc(ct->ptls, jl_datatype_size(ty), ty);
-        converter<APInt>::write_value(ty, (char *)jl_data_ptr(newv), x);
-        return newv;
+        char *data = (char *)alloca(jl_datatype_size(ty));
+        converter<APInt>::write_value(ty, data, x);
+        return jl_new_bits(ty, data);
     }
 
     static void write_value(jl_value_t *ty, char *dest, const APInt &src)

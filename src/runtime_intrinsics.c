@@ -782,3 +782,7 @@ checked_iintrinsic_div(LLVMRem_sov, checked_srem_int,  )
 checked_iintrinsic_div(LLVMRem_uov, checked_urem_int, u)
 
 // functions
+
+/* cvt_iintrinsic(LLVMTrunc, trunc_int) */
+/* cvt_iintrinsic(LLVMSExt, sext_int) */
+/* cvt_iintrinsic(LLVMZExt, zext_int) */
