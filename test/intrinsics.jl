@@ -2,6 +2,7 @@
 
 # intrinsic functions
 
+using Test
 # For curmod_*
 include("testenv.jl")
 
@@ -36,12 +37,12 @@ truncbool(u) = reinterpret(UInt8, reinterpret(Bool, u))
         @test_throws ErrorException("fptrunc: output bitsize must be < input bitsize")  Core.Intrinsics.fptrunc(Float32, bf16_1)
     end
 
-    @test_throws ErrorException("ZExt: output bitsize must be > input bitsize")     Core.Intrinsics.zext_int(Int8, 0x00)
-    @test_throws ErrorException("SExt: output bitsize must be > input bitsize")     Core.Intrinsics.sext_int(Int8, 0x00)
-    @test_throws ErrorException("ZExt: output bitsize must be > input bitsize")     Core.Intrinsics.zext_int(Int8, 0x0000)
-    @test_throws ErrorException("SExt: output bitsize must be > input bitsize")     Core.Intrinsics.sext_int(Int8, 0x0000)
-    @test_throws ErrorException("Trunc: output bitsize must be < input bitsize")    Core.Intrinsics.trunc_int(Int8, 0x00)
-    @test_throws ErrorException("Trunc: output bitsize must be < input bitsize")    Core.Intrinsics.trunc_int(Int16, 0x00)
+    @test_throws ErrorException("zext_int: output bitsize must be > input bitsize")     Core.Intrinsics.zext_int(Int8, 0x00)
+    @test_throws ErrorException("sext_int: output bitsize must be > input bitsize")     Core.Intrinsics.sext_int(Int8, 0x00)
+    @test_throws ErrorException("zext_int: output bitsize must be > input bitsize")     Core.Intrinsics.zext_int(Int8, 0x0000)
+    @test_throws ErrorException("sext_int: output bitsize must be > input bitsize")     Core.Intrinsics.sext_int(Int8, 0x0000)
+    @test_throws ErrorException("trunc_int: output bitsize must be < input bitsize")    Core.Intrinsics.trunc_int(Int8, 0x00)
+    @test_throws ErrorException("trunc_int: output bitsize must be < input bitsize")    Core.Intrinsics.trunc_int(Int16, 0x00)
 end
 
 # issue #4581
@@ -230,6 +231,7 @@ end
 
     # ternary
     @test_intrinsic Core.Intrinsics.fma_float Float64(3.3) Float64(4.4) Float64(5.5) Float64(20.02)
+    @test_intrinsic Core.Intrinsics.fma_float 0x1.0000000000001p0 1.25 0x1p-54 0x1.4000000000002p0
     @test_intrinsic Core.Intrinsics.muladd_float Float64(3.3) Float64(4.4) Float64(5.5) Float64(20.02)
 
     # boolean
@@ -245,6 +247,10 @@ end
     @test_intrinsic Core.Intrinsics.uitofp Float64 UInt(3) Float64(3.0)
     @test_intrinsic Core.Intrinsics.fptosi Int Float64(3.3) 3
     @test_intrinsic Core.Intrinsics.fptoui UInt Float64(3.3) UInt(3)
+
+    # #57384
+    @test_intrinsic Core.Intrinsics.fptosi Int 1.5 1
+    @test_intrinsic Core.Intrinsics.fptosi Int128 1.5 Int128(1)
 end
 
 @testset "Float32 intrinsics" begin
@@ -264,6 +270,7 @@ end
 
     # ternary
     @test_intrinsic Core.Intrinsics.fma_float Float32(3.3) Float32(4.4) Float32(5.5) Float32(20.02)
+    @test_intrinsic Core.Intrinsics.fma_float Float32(0x1.000002p0) 1.25f0 Float32(0x1p-25) Float32(0x1.400004p0)
     @test_intrinsic Core.Intrinsics.muladd_float Float32(3.3) Float32(4.4) Float32(5.5) Float32(20.02)
 
     # boolean

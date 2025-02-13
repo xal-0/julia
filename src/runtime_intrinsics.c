@@ -187,120 +187,6 @@ static inline uint16_t float_to_half(float param) JL_NOTSAFEPOINT
     return h;
 }
 
-static inline uint16_t double_to_half(double param) JL_NOTSAFEPOINT
-{
-    float temp = (float)param;
-    uint32_t tempi;
-    memcpy(&tempi, &temp, sizeof(temp));
-
-    // if Float16(res) is subnormal
-    if ((tempi&0x7fffffffu) < 0x38800000u) {
-        // shift so that the mantissa lines up where it would for normal Float16
-        uint32_t shift = 113u-((tempi & 0x7f800000u)>>23u);
-        if (shift<23u) {
-            tempi |= 0x00800000; // set implicit bit
-            tempi >>= shift;
-        }
-    }
-
-    // if we are halfway between 2 Float16 values
-    if ((tempi & 0x1fffu) == 0x1000u) {
-        memcpy(&tempi, &temp, sizeof(temp));
-        // adjust the value by 1 ULP in the direction that will make Float16(temp) give the right answer
-        tempi += (fabs(temp) < fabs(param)) - (fabs(param) < fabs(temp));
-        memcpy(&temp, &tempi, sizeof(temp));
-    }
-
-    return float_to_half(temp);
-}
-
-// x86-specific helpers for emulating the (B)Float16 ABI
-#if defined(_CPU_X86_) || defined(_CPU_X86_64_)
-#include <xmmintrin.h>
-__attribute__((unused)) static inline __m128 return_in_xmm(uint16_t input) JL_NOTSAFEPOINT {
-    __m128 xmm_output;
-    asm (
-        "movd %[input], %%xmm0\n\t"
-        "movss %%xmm0, %[xmm_output]\n\t"
-        : [xmm_output] "=x" (xmm_output)
-        : [input] "r" ((uint32_t)input)
-        : "xmm0"
-    );
-    return xmm_output;
-}
-__attribute__((unused)) static inline uint16_t take_from_xmm(__m128 xmm_input) JL_NOTSAFEPOINT {
-    uint32_t output;
-    asm (
-        "movss %[xmm_input], %%xmm0\n\t"
-        "movd %%xmm0, %[output]\n\t"
-        : [output] "=r" (output)
-        : [xmm_input] "x" (xmm_input)
-        : "xmm0"
-    );
-    return (uint16_t)output;
-}
-#endif
-
-// float16 conversion API
-
-// for use in APInt and other soft-float ABIs (i.e. without the ABI shenanigans from below)
-JL_DLLEXPORT uint16_t julia_float_to_half(float param) {
-    return float_to_half(param);
-}
-JL_DLLEXPORT uint16_t julia_double_to_half(double param) {
-    return double_to_half(param);
-}
-JL_DLLEXPORT float julia_half_to_float(uint16_t param) {
-    return half_to_float(param);
-}
-
-// starting with GCC 12 and Clang 15, we have _Float16 on most platforms
-// (but not on Windows; this may be a bug in the MSYS2 GCC compilers)
-#if ((defined(__GNUC__) && __GNUC__ > 11) || \
-     (defined(__clang__) && __clang_major__ > 14)) && \
-    !defined(_CPU_PPC64_) && !defined(_CPU_PPC_) && \
-    !defined(_OS_WINDOWS_) && !defined(_CPU_RISCV64_)
-    #define FLOAT16_TYPE _Float16
-    #define FLOAT16_TO_UINT16(x) (*(uint16_t*)&(x))
-    #define FLOAT16_FROM_UINT16(x) (*(_Float16*)&(x))
-// on older compilers, we need to emulate the platform-specific ABI
-#elif defined(_CPU_X86_) || (defined(_CPU_X86_64_) && !defined(_OS_WINDOWS_))
-    // on x86, we can use __m128; except on Windows where x64 calling
-    // conventions expect to pass __m128 by reference.
-    #define FLOAT16_TYPE __m128
-    #define FLOAT16_TO_UINT16(x) take_from_xmm(x)
-    #define FLOAT16_FROM_UINT16(x) return_in_xmm(x)
-#elif defined(_CPU_PPC64_) || defined(_CPU_PPC_)
-    // on PPC, pass Float16 as if it were an integer, similar to the old x86 ABI
-    // before _Float16
-    #define FLOAT16_TYPE uint16_t
-    #define FLOAT16_TO_UINT16(x) (x)
-    #define FLOAT16_FROM_UINT16(x) (x)
-#else
-    // otherwise, pass using floating-point calling conventions
-    #define FLOAT16_TYPE float
-    #define FLOAT16_TO_UINT16(x) ((uint16_t)*(uint32_t*)&(x))
-    #define FLOAT16_FROM_UINT16(x) ({ uint32_t tmp = (uint32_t)(x); *(float*)&tmp; })
-#endif
-
-JL_DLLEXPORT float julia__gnu_h2f_ieee(FLOAT16_TYPE param)
-{
-    uint16_t param16 = FLOAT16_TO_UINT16(param);
-    return half_to_float(param16);
-}
-
-JL_DLLEXPORT FLOAT16_TYPE julia__gnu_f2h_ieee(float param)
-{
-    uint16_t res = float_to_half(param);
-    return FLOAT16_FROM_UINT16(res);
-}
-
-JL_DLLEXPORT FLOAT16_TYPE julia__truncdfhf2(double param)
-{
-    uint16_t res = double_to_half(param);
-    return FLOAT16_FROM_UINT16(res);
-}
-
 
 // bfloat16 conversion helpers
 
@@ -390,7 +276,6 @@ JL_DLLEXPORT BFLOAT16_TYPE julia__truncdfbf2(double param) JL_NOTSAFEPOINT
     return BFLOAT16_FROM_UINT16(res);
 }
 
-
 static inline char signbitbyte(void *a, unsigned bytes) JL_NOTSAFEPOINT
 {
     // sign bit of an signed number of n bytes, as a byte
@@ -424,181 +309,6 @@ static inline unsigned select_by_size(unsigned sz) JL_NOTSAFEPOINT
         if (!thunk) thunk = list[0]; \
         return thunk; \
     }
-
-#define fp_select(a, func) \
-    sizeof(a) <= sizeof(float) ? func##f((float)a) : func(a)
-#define fp_select2(a, b, func) \
-    sizeof(a) <= sizeof(float) ? func##f(a, b) : func(a, b)
-
-// fast-function generators //
-
-// integer input
-// OP::Function macro(input)
-// name::unique string
-// nbits::number of bits
-// c_type::c_type corresponding to nbits
-#define un_iintrinsic_ctype(OP, name, nbits, c_type) \
-static inline void jl_##name##nbits(unsigned runtime_nbits, void *pa, void *pr) JL_NOTSAFEPOINT \
-{ \
-    c_type a = *(c_type*)pa; \
-    *(c_type*)pr = OP(a); \
-}
-
-// integer input, unsigned output
-// OP::Function macro(input)
-// name::unique string
-// nbits::number of bits
-// c_type::c_type corresponding to nbits
-#define uu_iintrinsic_ctype(OP, name, nbits, c_type) \
-static inline unsigned jl_##name##nbits(unsigned runtime_nbits, void *pa) JL_NOTSAFEPOINT \
-{ \
-    c_type a = *(c_type*)pa; \
-    return OP(a); \
-}
-
-// floating point
-// OP::Function macro(output pointer, input)
-// name::unique string
-// nbits::number of bits in the *input*
-// c_type::c_type corresponding to nbits
-#define un_fintrinsic_ctype(OP, name, c_type) \
-static inline void name(unsigned osize, jl_value_t *ty, void *pa, void *pr) JL_NOTSAFEPOINT \
-{ \
-    c_type a = *(c_type*)pa; \
-    OP(ty, (c_type*)pr, a); \
-}
-
-#define un_fintrinsic_half(OP, name)                                            \
-    static inline void name(unsigned osize, jl_value_t *ty, void *pa, void *pr) \
-        JL_NOTSAFEPOINT                                                         \
-    {                                                                           \
-        uint16_t a = *(uint16_t *)pa;                                           \
-        float R, A = half_to_float(a);                                          \
-        OP(ty, &R, A);                                                          \
-        *(uint16_t *)pr = float_to_half(R);                                     \
-    }
-
-#define un_fintrinsic_bfloat(OP, name)                                          \
-    static inline void name(unsigned osize, jl_value_t *ty, void *pa, void *pr) \
-        JL_NOTSAFEPOINT                                                         \
-    {                                                                           \
-        uint16_t a = *(uint16_t *)pa;                                           \
-        float R, A = bfloat_to_float(a);                                        \
-        OP(ty, &R, A);                                                          \
-        *(uint16_t *)pr = float_to_bfloat(R);                                   \
-    }
-
-// float or integer inputs
-// OP::Function macro(inputa, inputb)
-// name::unique string
-// nbits::number of bits
-// c_type::c_type corresponding to nbits
-#define bi_intrinsic_ctype(OP, name, nbits, c_type) \
-static void jl_##name##nbits(unsigned runtime_nbits, void *pa, void *pb, void *pr) JL_NOTSAFEPOINT \
-{ \
-    c_type a = *(c_type*)pa; \
-    c_type b = *(c_type*)pb; \
-    *(c_type*)pr = (c_type)OP(a, b); \
-}
-
-#define bi_intrinsic_half(OP, name) \
-static void jl_##name##16(unsigned runtime_nbits, void *pa, void *pb, void *pr) JL_NOTSAFEPOINT \
-{ \
-    uint16_t a = *(uint16_t*)pa; \
-    uint16_t b = *(uint16_t*)pb; \
-    float A = half_to_float(a); \
-    float B = half_to_float(b); \
-    runtime_nbits = 16; \
-    float R = OP(A, B); \
-    *(uint16_t*)pr = float_to_half(R); \
-}
-
-#define bi_intrinsic_bfloat(OP, name) \
-static void jl_##name##bf16(unsigned runtime_nbits, void *pa, void *pb, void *pr) JL_NOTSAFEPOINT \
-{ \
-    uint16_t a = *(uint16_t*)pa; \
-    uint16_t b = *(uint16_t*)pb; \
-    float A = bfloat_to_float(a); \
-    float B = bfloat_to_float(b); \
-    runtime_nbits = 16; \
-    float R = OP(A, B); \
-    *(uint16_t*)pr = float_to_bfloat(R); \
-}
-
-// float or integer inputs, bool output
-// OP::Function macro(inputa, inputb)
-// name::unique string
-// nbits::number of bits
-// c_type::c_type corresponding to nbits
-#define bool_intrinsic_ctype(OP, name, nbits, c_type) \
-static int jl_##name##nbits(unsigned runtime_nbits, void *pa, void *pb) JL_NOTSAFEPOINT \
-{ \
-    c_type a = *(c_type*)pa; \
-    c_type b = *(c_type*)pb; \
-    return OP(a, b); \
-}
-
-#define bool_intrinsic_half(OP, name) \
-static int jl_##name##16(unsigned runtime_nbits, void *pa, void *pb) JL_NOTSAFEPOINT \
-{ \
-    uint16_t a = *(uint16_t*)pa; \
-    uint16_t b = *(uint16_t*)pb; \
-    float A = half_to_float(a); \
-    float B = half_to_float(b); \
-    runtime_nbits = 16; \
-    return OP(A, B); \
-}
-
-#define bool_intrinsic_bfloat(OP, name) \
-static int jl_##name##bf16(unsigned runtime_nbits, void *pa, void *pb) JL_NOTSAFEPOINT \
-{ \
-    uint16_t a = *(uint16_t*)pa; \
-    uint16_t b = *(uint16_t*)pb; \
-    float A = bfloat_to_float(a); \
-    float B = bfloat_to_float(b); \
-    runtime_nbits = 16; \
-    return OP(A, B); \
-}
-
-
-// integer inputs, with precondition test
-// OP::Function macro(inputa, inputb)
-// name::unique string
-// nbits::number of bits
-// c_type::c_type corresponding to nbits
-#define checked_intrinsic_ctype(CHECK_OP, OP, name, nbits, c_type) \
-static int jl_##name##nbits(unsigned runtime_nbits, void *pa, void *pb, void *pr) JL_NOTSAFEPOINT \
-{ \
-    c_type a = *(c_type*)pa; \
-    c_type b = *(c_type*)pb; \
-    *(c_type*)pr = (c_type)OP(a, b); \
-    return CHECK_OP(c_type, a, b);    \
-}
-
-// conversion operator
-
-typedef void (*intrinsic_cvt_t)(jl_datatype_t*, void*, jl_datatype_t*, void*);
-typedef unsigned (*intrinsic_cvt_check_t)(unsigned, unsigned, void*);
-#define cvt_iintrinsic(LLVMOP, name) \
-JL_DLLEXPORT jl_value_t *jl_##name(jl_value_t *ty, jl_value_t *a) \
-{ \
-    return jl_intrinsic_cvt(ty, a, #name, LLVMOP); \
-}
-
-static inline jl_value_t *jl_intrinsic_cvt(jl_value_t *ty, jl_value_t *a, const char *name, intrinsic_cvt_t op)
-{
-    JL_TYPECHKS(name, datatype, ty);
-    if (!jl_is_concrete_type(ty) || !jl_is_primitivetype(ty))
-        jl_errorf("%s: target type not a leaf primitive type", name);
-    jl_value_t *aty = jl_typeof(a);
-    if (!jl_is_primitivetype(aty))
-        jl_errorf("%s: value is not a primitive type", name);
-    void *pa = jl_data_ptr(a);
-    unsigned osize = jl_datatype_size(ty);
-    void *pr = alloca(osize);
-    op((jl_datatype_t*)aty, pa, (jl_datatype_t*)ty, pr);
-    return jl_new_bits(ty, pr);
-}
 
 // integer
 typedef int (*intrinsic_checked_t)(unsigned, void*, void*, void*) JL_NOTSAFEPOINT;
@@ -684,10 +394,6 @@ static inline jl_value_t *jl_intrinsiclambda_checkeddiv(jl_value_t *ty, void *pa
 
 
 // conversions
-cvt_iintrinsic(LLVMSItoFP, sitofp)
-cvt_iintrinsic(LLVMUItoFP, uitofp)
-cvt_iintrinsic(LLVMFPtoSI, fptosi)
-cvt_iintrinsic(LLVMFPtoUI, fptoui)
 
 #define fintrinsic_read_float16(p)   half_to_float(*(uint16_t *)p)
 #define fintrinsic_read_bfloat16(p)  bfloat_to_float(*(uint16_t *)p)
@@ -705,59 +411,6 @@ cvt_iintrinsic(LLVMFPtoUI, fptoui)
  * ty:  Type argument (output)
  * pr:  Pointer to result data
  */
-
-static inline void fptrunc(jl_datatype_t *aty, void *pa, jl_datatype_t *ty, void *pr)
-{
-    unsigned isize = jl_datatype_size(aty), osize = jl_datatype_size(ty);
-    if (!(osize < isize)) {
-        jl_error("fptrunc: output bitsize must be < input bitsize");
-        return;
-    }
-
-#define fptrunc_convert(in, out)                                \
-    else if (aty == jl_##in##_type && ty == jl_##out##_type)    \
-        fintrinsic_write_##out(pr, fintrinsic_read_##in(pa))
-
-    if (0)
-        ;
-    fptrunc_convert(float32, float16);
-    fptrunc_convert(float64, float16);
-    fptrunc_convert(float32, bfloat16);
-    fptrunc_convert(float64, bfloat16);
-    fptrunc_convert(float64, float32);
-    else
-        jl_error("fptrunc: runtime floating point intrinsics are not implemented for bit sizes other than 16, 32 and 64");
-#undef fptrunc_convert
-}
-
-static inline void fpext(jl_datatype_t *aty, void *pa, jl_datatype_t *ty, void *pr)
-{
-    unsigned isize = jl_datatype_size(aty), osize = jl_datatype_size(ty);
-    if (!(osize > isize)) {
-        jl_error("fpext: output bitsize must be > input bitsize");
-        return;
-    }
-
-#define fpext_convert(in, out)                                  \
-    else if (aty == jl_##in##_type && ty == jl_##out##_type)    \
-        fintrinsic_write_##out(pr, fintrinsic_read_##in(pa))
-
-    if (0)
-        ;
-    fpext_convert(float16, float32);
-    fpext_convert(float16, float64);
-    fpext_convert(bfloat16, float32);
-    fpext_convert(bfloat16, float64);
-    fpext_convert(float32, float64);
-    else
-        jl_error("fptrunc: runtime floating point intrinsics are not implemented for bit sizes other than 16, 32 and 64");
-#undef fpext_convert
-}
-
-cvt_iintrinsic(fptrunc, fptrunc)
-cvt_iintrinsic(fpext, fpext)
-
-
 // checked arithmetic
 /**
  * s_typemin = - s_typemax - 1
@@ -776,13 +429,7 @@ cvt_iintrinsic(fpext, fpext)
     ((t)(8 * sizeof(t) == runtime_nbits                         \
          ? (~((t)0)) : (~(((t)~((t)0)) << runtime_nbits))))
 
-checked_iintrinsic_div(LLVMDiv_sov, checked_sdiv_int,  )
+/* checked_iintrinsic_div(LLVMDiv_sov, checked_sdiv_int,  ) */
 checked_iintrinsic_div(LLVMDiv_uov, checked_udiv_int, u)
 checked_iintrinsic_div(LLVMRem_sov, checked_srem_int,  )
 checked_iintrinsic_div(LLVMRem_uov, checked_urem_int, u)
-
-// functions
-
-/* cvt_iintrinsic(LLVMTrunc, trunc_int) */
-/* cvt_iintrinsic(LLVMSExt, sext_int) */
-/* cvt_iintrinsic(LLVMZExt, zext_int) */

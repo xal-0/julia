@@ -17,6 +17,14 @@ namespace {
 using namespace std;
 using namespace llvm;
 
+#undef jl_datatype_size
+unsigned jl_datatype_size(jl_datatype_t *ty) {
+    return ty->layout->size;
+}
+unsigned jl_datatype_size(jl_value_t *ty) {
+    return ((jl_datatype_t *)ty)->layout->size;
+}
+
 float julia_fma(float a, float b, float c);
 double julia_fma(double a, double b, double c);
 
@@ -220,7 +228,7 @@ using dispatch_unsigned = dispatch_size<OP, uint8_t, uint16_t, uint32_t, uint64_
 // OP will use the appropriately signed operation, so there is no need to have
 // two versions.
 template<template<typename> class OP>
-using dispatch_slow = dispatch_size<OP, APSInt, APSInt, APSInt, APSInt, true>;
+using dispatch_apint = dispatch_size<OP, APSInt, APSInt, APSInt, APSInt, true>;
 
 // Load the least significant uint8_t from a primitive jl_value_t (must be at
 // least 1 byte).
@@ -405,7 +413,7 @@ struct shl {
 };
 template<>
 struct shl<APSInt> {
-    APInt operator()(APSInt a, APSInt b) { return a.shl(b); }
+    APInt operator()(const APInt &a, const APInt &b) { return a.shl(b); }
 };
 
 template<typename T>
@@ -420,7 +428,7 @@ struct lshr {
 
 template<>
 struct lshr<APSInt> {
-    APInt operator()(APSInt a, APSInt b) { return a.lshr(b); }
+    APInt operator()(const APInt &a, const APInt &b) { return a.lshr(b); }
 };
 
 template<typename T>
@@ -434,7 +442,7 @@ struct ashr {
 };
 template<>
 struct ashr<APSInt> {
-    APInt operator()(APSInt a, APSInt b) { return a.ashr(b); }
+    APInt operator()(const APInt &a, const APInt &b) { return a.ashr(b); }
 };
 
 // Can use C++23's std::byteswap when widely implemented
@@ -444,7 +452,7 @@ struct bswap {
 };
 template<>
 struct bswap<APSInt> {
-    APInt operator()(APSInt a) { return a.byteSwap(); }
+    APInt operator()(const APInt &a) { return a.byteSwap(); }
 };
 
 // Can use C++20's std::popcount/countl_zero/countr_zero when widely implemented
@@ -454,7 +462,7 @@ struct ctpop {
 };
 template<>
 struct ctpop<APSInt> {
-    APInt operator()(APSInt a) { return {a.getBitWidth(), a.popcount()}; }
+    APInt operator()(const APInt &a) { return {a.getBitWidth(), a.popcount()}; }
 };
 
 template<typename T>
@@ -463,7 +471,7 @@ struct ctlz {
 };
 template<>
 struct ctlz<APSInt> {
-    APInt operator()(APSInt a) { return {a.getBitWidth(), a.countl_zero()}; }
+    APInt operator()(const APInt &a) { return {a.getBitWidth(), a.countl_zero()}; }
 };
 
 template<typename T>
@@ -472,7 +480,7 @@ struct cttz {
 };
 template<>
 struct cttz<APSInt> {
-    APInt operator()(APSInt a) { return {a.getBitWidth(), a.countr_zero()}; }
+    APInt operator()(const APInt &a) { return {a.getBitWidth(), a.countr_zero()}; }
 };
 
 //// Conversion
@@ -637,7 +645,7 @@ struct checked_sadd {
 };
 template<>
 struct checked_sadd<APSInt> {
-    tuple<APInt, bool> operator()(APSInt a, APSInt b)
+    tuple<APInt, bool> operator()(const APInt &a, const APInt &b)
     {
         bool overflow;
         APInt r = a.sadd_ov(b, overflow);
@@ -656,7 +664,7 @@ struct checked_uadd {
 };
 template<>
 struct checked_uadd<APSInt> {
-    tuple<APInt, bool> operator()(APSInt a, APSInt b)
+    tuple<APInt, bool> operator()(const APInt &a, const APInt &b)
     {
         bool overflow;
         APInt r = a.uadd_ov(b, overflow);
@@ -677,7 +685,7 @@ struct checked_ssub {
 };
 template<>
 struct checked_ssub<APSInt> {
-    tuple<APInt, bool> operator()(APSInt a, APSInt b)
+    tuple<APInt, bool> operator()(const APInt &a, const APInt &b)
     {
         bool overflow;
         APInt r = a.ssub_ov(b, overflow);
@@ -696,7 +704,7 @@ struct checked_usub {
 };
 template<>
 struct checked_usub<APSInt> {
-    tuple<APInt, bool> operator()(APSInt a, APSInt b)
+    tuple<APInt, bool> operator()(const APInt &a, const APInt &b)
     {
         bool overflow;
         APInt r = a.usub_ov(b, overflow);
@@ -706,7 +714,7 @@ struct checked_usub<APSInt> {
 
 template<typename T>
 struct checked_smul {
-    tuple<APInt, bool> operator()(APSInt a, APSInt b)
+    tuple<APInt, bool> operator()(const APInt &a, const APInt &b)
     {
         bool overflow;
         APInt r = a.smul_ov(b, overflow);
@@ -716,11 +724,37 @@ struct checked_smul {
 
 template<typename T>
 struct checked_umul {
-    tuple<APInt, bool> operator()(APSInt a, APSInt b)
+    tuple<APInt, bool> operator()(const APInt &a, const APInt &b)
     {
         bool overflow;
         APInt r = a.umul_ov(b, overflow);
         return {r, overflow};
+    }
+};
+
+template<typename T>
+struct checked_sdiv {
+    APInt operator()(const APInt &a, const APInt &b) {
+        { // end scope before jl_throw call
+            bool overflow;
+            APInt r = a.sdiv_ov(b, overflow);
+            if (!overflow)
+                return r;
+        }
+        jl_throw(jl_diverror_exception);
+    }
+};
+
+template<typename T>
+struct checked_udiv {
+    APInt operator()(const APInt &a, const APInt &b) {
+        { // end scope before jl_throw call
+            bool overflow;
+            APInt r = a.udiv_ov(b, overflow);
+            if (!overflow)
+                return r;
+        }
+        jl_throw(jl_diverror_exception);
     }
 };
 
@@ -1196,14 +1230,16 @@ INTRINSIC_2_CVT(fpext, fpext)
 
 // Checked arithmetic
 // Note: the checked arithmetic operations must be unsigned to avoid UB
-// (unsigned and signed add/sub are the same, unsigned/signed multiplication is
-// identical for the low half.)
 INTRINSIC_2_ARITH(dispatch_unsigned, checked_sadd_int, checked_sadd)
 INTRINSIC_2_ARITH(dispatch_unsigned, checked_uadd_int, checked_uadd)
 INTRINSIC_2_ARITH(dispatch_unsigned, checked_ssub_int, checked_ssub)
 INTRINSIC_2_ARITH(dispatch_unsigned, checked_usub_int, checked_usub)
-INTRINSIC_2_ARITH(dispatch_slow, checked_smul_int, checked_smul)
-INTRINSIC_2_ARITH(dispatch_slow, checked_umul_int, checked_umul)
+INTRINSIC_2_ARITH(dispatch_apint, checked_smul_int, checked_smul)
+INTRINSIC_2_ARITH(dispatch_apint, checked_umul_int, checked_umul)
+INTRINSIC_2_ARITH(dispatch_apint, checked_sdiv_int, checked_sdiv)
+// INTRINSIC_2_ARITH(dispatch_apint, checked_udiv_int, checked_umul)
+// INTRINSIC_2_ARITH(dispatch_apint, checked_srem_int, checked_srem)
+// INTRINSIC_2_ARITH(dispatch_apint, checked_urem_int, checked_urem)
 
 // Functions
 INTRINSIC_2_ARITH(dispatch_float, copysign_float, copysign_)
@@ -1546,14 +1582,6 @@ static inline float bfloat_to_float(uint16_t param) JL_NOTSAFEPOINT
 }
 
 // bfloat16 conversion API
-
-// for use in APInt (without the ABI shenanigans from below)
-uint16_t julia_float_to_bfloat(float param) {
-    return float_to_bfloat(param);
-}
-float julia_bfloat_to_float(uint16_t param) {
-    return bfloat_to_float(param);
-}
 
 // starting with GCC 13 and Clang 17, we have __bf16 on most platforms
 // (but not on Windows; this may be a bug in the MSYS2 GCC compilers)
