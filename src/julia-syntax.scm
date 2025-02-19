@@ -1468,6 +1468,8 @@
                   ;; because the symbols come out wrong. Sigh... So much effort for such a syntax corner case.
                   (expand-tuple-destruct (cdr (cadr arg)) (caddr arg) (lambda (assgn) `(,(car e) ,assgn))))
                 (else
+                 (unless (const-lhs? (cadr arg))
+                   (error (string "`const` left hand side \"" (deparse (cadr arg)) "\" contains non-variables")))
                  (let* ((vars (filter-not-underscore (lhs-vars (cadr arg))))
                         (rr (make-ssavalue))
                         (temp (map (lambda (v) (make-ssavalue)) vars)))
@@ -2978,6 +2980,15 @@
 
 (define (lhs-vars e)
   (map decl-var (lhs-decls e)))
+
+;; Does the assignment LHS only declare new variables (no assignment to (ref ...))
+(define (const-lhs? e)
+  (cond ((symdecl? e)   #t)
+        ((and (pair? e)
+              (or (eq? (car e) 'tuple)
+                  (eq? (car e) 'parameters)))
+         (every const-lhs? (cdr e)))
+        (else #f)))
 
 (define (all-decl-vars e)  ;; map decl-var over every level of an assignment LHS
   (cond ((eventually-call? e) e)
