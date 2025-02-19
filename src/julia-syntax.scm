@@ -1466,7 +1466,8 @@
                 ((and (pair? (cadr arg)) (eq? (caadr arg) 'tuple) (not (has-parameters? (cdr (cadr arg)))))
                   ;; We need this case because `(f(), g()) = (1, 2)` goes through here, which cannot go via the `local` lowering below,
                   ;; because the symbols come out wrong. Sigh... So much effort for such a syntax corner case.
-                  (expand-tuple-destruct (cdr (cadr arg)) (caddr arg) (lambda (assgn) `(,(car e) ,assgn))))
+                  (expand-tuple-destruct (cdr (cadr arg)) (caddr arg)
+                                         (lambda (assgn) `(,(car e) ,(if global `(global ,assgn) assgn)))))
                 (else
                  (unless (const-lhs? (cadr arg))
                    (error (string "`const` left hand side \"" (deparse (cadr arg)) "\" contains non-variables")))
