@@ -3570,7 +3570,7 @@ static int jl_validate_binding_partition(jl_binding_t *b, jl_binding_partition_t
     if (latest_imported_bpart->min_world <= bpart->min_world) {
 add_backedge:
         // Imported binding is still valid
-        if ((kind == BINDING_KIND_EXPLICIT || kind == BINDING_KIND_IMPORTED) &&
+        if ((kind == BINDING_KIND_EXPLICIT) &&
                 external_blob_index((jl_value_t*)imported_binding) != mod_idx) {
             jl_add_binding_backedge(imported_binding, (jl_value_t*)b);
         }

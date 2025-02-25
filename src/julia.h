@@ -642,7 +642,6 @@ typedef struct _jl_weakref_t {
 //      BINDING_KIND_CONST
 //      BINDING_KIND_CONST_IMPORT
 //      BINDING_KIND_EXPLICIT
-//      BINDING_KIND_IMPORTED
 //      BINDING_KIND_GLOBAL
 //      BINDING_KIND_UNDEF_CONST
 //
@@ -678,12 +677,9 @@ enum jl_partition_kind {
     // Implicit: The binding was implicitly imported from a `using`'d module.
     //  ->restriction holds the imported binding
     BINDING_KIND_IMPLICIT     = 0x3,
-    // Explicit: The binding was explicitly `using`'d by name
+    // Explicit: The binding was explicitly `using`'d or `import`'d by name
     //  ->restriction holds the imported binding
     BINDING_KIND_EXPLICIT     = 0x4,
-    // Imported: The binding was explicitly `import`'d by name
-    //  ->restriction holds the imported binding
-    BINDING_KIND_IMPORTED     = 0x5,
     // Failed: We attempted to import the binding, but the import was ambiguous
     //  ->restriction is NULL.
     BINDING_KIND_FAILED       = 0x6,

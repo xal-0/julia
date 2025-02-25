@@ -3398,10 +3398,7 @@ function print_partition(io::IO, partition::Core.BindingPartition)
         print(io, "implicit `using` from ")
         print(io, partition_restriction(partition).globalref)
     elseif kind == BINDING_KIND_EXPLICIT
-        print(io, "explicit `using` from ")
-        print(io, partition_restriction(partition).globalref)
-    elseif kind == BINDING_KIND_IMPORTED
-        print(io, "explicit `import` from ")
+        print(io, "explicit `using` or `import` from ")
         print(io, partition_restriction(partition).globalref)
     else
         @assert kind == BINDING_KIND_GLOBAL
