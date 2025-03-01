@@ -12,6 +12,8 @@ const CC = Base.Compiler
 using Base.Meta
 using Base: propertynames, something, IdSet
 using Base.Filesystem: _readdirx
+using Base.JuliaSyntax: SyntaxNode, GreenNode, parsestmt, children, byte_range,
+    span, head, kind, @K_str, is_trivia, SourceFile, sourcetext
 
 using ..REPL.LineEdit: NamedCompletion
 
@@ -816,6 +818,7 @@ function recursive_explore_names(callee_module::Module, initial_module::Module)
 end
 
 function complete_any_methods(ex_org::Expr, callee_module::Module, context_module::Module, moreargs::Bool, shift::Bool)
+    println("complete_any_methods $ex_org")
     out = Completion[]
     args_ex, kwargs_ex, kwargs_flag = try
         # this may throw, since we set default_any to false
@@ -1004,7 +1007,9 @@ function dict_identifier_key(str::String, tag::Symbol, context_module::Module=Ma
     end
     frange, end_of_identifier = find_start_brace(str_close, c_start='[', c_end=']')
     isempty(frange) && return (nothing, nothing, nothing)
+    println("looking for dict access: $frange $end_of_identifier $(str[1:end_of_identifier])")
     objstr = str[1:end_of_identifier]
+    println("objstr=$objstr")
     objex = Meta.parse(objstr, raise=false, depwarn=false)
     objt = repl_eval_ex(objex, context_module)
     isa(objt, Core.Const) || return (nothing, nothing, nothing)
@@ -1013,6 +1018,7 @@ function dict_identifier_key(str::String, tag::Symbol, context_module::Module=Ma
     (Base.haslength(obj) && length(obj)::Int < 1_000_000) || return (nothing, nothing, nothing)
     begin_of_key = something(findnext(!isspace, str, nextind(str, end_of_identifier) + 1), # +1 for [
                              lastindex(str)+1)
+    println("obj=$obj, begin_of_key=$begin_of_key $(str[begin_of_key:end])")
     return (obj, str[begin_of_key:end], begin_of_key)
 end
 
@@ -1060,6 +1066,7 @@ end
 function complete_keyword_argument(partial::String, last_idx::Int, context_module::Module;
                                    shift::Bool=false)
     frange, ex, wordrange, = identify_possible_method_completion(partial, last_idx)
+    # println("identified keyword argument method: frange=$frange ex=$ex wordrange=$wordrange")
     fail = Completion[], 0:-1, frange
     ex.head === :call || is_broadcasting_expr(ex) || return fail
 
@@ -1134,6 +1141,13 @@ function complete_identifiers!(suggestions::Vector{Completion},
                                comp_keywords::Bool=false,
                                complete_modules_only::Bool=false,
                                shift::Bool=false)
+    # println("completing identifier $(repr(string)) name=$(repr(name)) shift=$shift")
+    # if separatorpos > 1
+    #     println("   seppos   $(string[1:separatorpos])|$(string[nextind(string, separatorpos):end])")
+    # end
+    # if startpos > 1 && startpos < sizeof(string)
+    #     println("   startpos $(string[1:startpos])|$(string[nextind(string, startpos):end])")
+    # end
     if comp_keywords
         complete_keyword!(suggestions, name)
         complete_keyval!(suggestions, name)
@@ -1142,6 +1156,7 @@ function complete_identifiers!(suggestions::Vector{Completion},
         s = string[1:prevind(string, separatorpos)]
         # First see if the whole string up to `pos` is a valid expression. If so, use it.
         prefix = Meta.parse(s, raise=false, depwarn=false)
+        # println("HAVE $prefix")
         if isexpr(prefix, :incomplete)
             s = string[startpos:pos]
             # Heuristic to find the start of the expression. TODO: This would be better
@@ -1162,7 +1177,7 @@ function complete_identifiers!(suggestions::Vector{Completion},
                         isempty(frange) && break # unbalanced parens
                         startpos = first(frange)
                         i = prevind(string, startpos)
-                    elseif c in ('\'', '\"', '\`')
+                    elseif c in ('\'', '\"', '`')
                         s = "$c$c"*string[startpos:pos]
                         break
                     else
@@ -1235,10 +1250,157 @@ function complete_identifiers!(suggestions::Vector{Completion},
     return suggestions
 end
 
+function syntax_search_pos(node::SyntaxNode, pos)
+    pos in byte_range(node) || return nothing
+    (cs = children(node)) === nothing && return node
+    for n in cs
+        c = syntax_search_pos(n, pos)
+        c === nothing || return c
+    end
+    return node
+end
+function syntax_search_pos(node::GreenNode, pos)
+    pos <= span(node) || return nothing
+    (cs = children(node)) === nothing && return node
+    for n in cs
+        c = syntax_search_pos(n, pos)
+        c === nothing || return c
+        pos -= span(n)
+    end
+    return node
+end
+
+const SpineEntry = @NamedTuple{node::Union{SyntaxNode, GreenNode}, idx::Int}
+
+function syntax_spine(node::SyntaxNode, pos)
+    spine = @NamedTuple{node::Union{SyntaxNode, GreenNode}, idx::Int}[(; node, idx=0)]
+    while (cs = children(node)) !== nothing
+        found = false
+        for (idx, n) in enumerate(cs)
+            if pos in byte_range(n)
+                node = n
+                push!(spine, (; node, idx))
+                found = true
+                break
+            end
+        end
+        if !found
+            syntax_spine(spine, node.raw, pos, first(byte_range(node)) - 1)
+            break
+        end
+    end
+    return spine
+end
+function syntax_spine(spine::Vector{SpineEntry}, node::GreenNode, pos, off)
+    while (cs = children(node)) !== nothing
+        for (idx, n) in enumerate(cs)
+            if pos - off <= span(n)
+                node = n
+                push!(spine, (; node, idx))
+                break
+            end
+            off += span(n)
+        end
+    end
+    return spine
+end
+
 function completions(string::String, pos::Int, context_module::Module=Main, shift::Bool=true, hint::Bool=false)
+    # TODO: parse to end or to pos?
+    node = parsestmt(SyntaxNode, string[1:pos], ignore_errors=true)
+    spine = syntax_spine(node, pos)
+
+    # TODO remove
+    hint && return Completion[], 0:-1, false
+    
+    println("\ncompletions for: $(string[1:pos])|$(string[nextind(string, pos):end])")
+    println("parsed (pos=$pos):")
+    show(stdout, MIME("text/plain"), node)
+    show(stdout, MIME("text/plain"), node.raw)
+    println("cursor:")
+    println([(typeof(node), kind(node), idx) for (; node, idx) in spine])
+
+    # Search for methods (requires tab press):
+    #   ?(x, y)TAB           lists methods you can call with these objects
+    #   ?(x, y TAB           lists methods that take these objects as the first two arguments
+    #   MyModule.?(x, y)TAB  restricts the search to names in MyModule
+    if !hint
+        cs = method_search(string[1:pos], context_module, shift)
+        cs !== nothing && return cs
+    end
+
+    node === nothing && return Completion[], 0:-1, false
+
+    # Complete keys in a Dict:
+    #   my_dict[ TAB
+    obj, dict, key = dict_identifier_key(spine)
+    if obj !== nothing
+        matches = find_dict_matches(obj, sourcetext(key))
+        length(matches)==1 && (lastindex(string) <= pos || string[nextind(string,pos)] != ']') && (matches[1]*=']')
+        length(matches)>0 && return Completion[DictCompletion(obj, match) for match in sort!(matches)], byte_range(key), true
+    end
+
+    return Completion[], 0:-1, false
+end
+
+# TODO: complete only when between []
+function dict_identifier_key(spine::Vector{SpineEntry}, context_module::Module=Main)
+    i = findlast(((; node, idx),) -> kind(node) == K"ref", spine)
+    i === nothing && return nothing, nothing, nothing
+    dict, key = children(spine[i].node)
+    objt = repl_eval_ex(Expr(dict), context_module)
+    isa(objt, Core.Const) || return nothing, nothing, nothing
+    obj = objt.val
+    isa(obj, AbstractDict) || return nothing, nothing
+    (Base.haslength(obj) && length(obj)::Int < 1_000_000) || return nothing, nothing, nothing
+    return obj, dict, key
+end
+
+function method_search(partial::String, context_module::Module, shift::Bool)
+    rexm = match(r"(\w+\.|)\?\((.*)$", partial)
+    if rexm !== nothing
+        # Get the module scope
+        if isempty(rexm.captures[1])
+            callee_module = context_module
+        else
+            modname = Symbol(rexm.captures[1][1:end-1])
+            if isdefined(context_module, modname)
+                callee_module = getfield(context_module, modname)
+                if !isa(callee_module, Module)
+                    callee_module = context_module
+                end
+            else
+                callee_module = context_module
+            end
+        end
+        moreargs = !endswith(rexm.captures[2], ')')
+        callstr = "_(" * rexm.captures[2]
+        if moreargs
+            callstr *= ')'
+        end
+        ex_org = Meta.parse(callstr, raise=false, depwarn=false)
+        if isa(ex_org, Expr)
+            return complete_any_methods(ex_org, callee_module::Module, context_module, moreargs, shift), (0:length(rexm.captures[1])+1) .+ rexm.offset, false
+        end
+    end
+end
+
+function completionsold(string::String, pos::Int, context_module::Module=Main, shift::Bool=true, hint::Bool=false)
     # First parse everything up to the current position
     partial = string[1:pos]
     inc_tag = Base.incomplete_tag(Meta.parse(partial, raise=false, depwarn=false))
+
+    node = parsestmt(SyntaxNode, string, ignore_errors=true)
+    child = syntax_search_pos(node, pos)
+
+    hint || println("\ncompletions for: $(string[1:pos])|$(string[nextind(string, pos):end])")
+    # println("parsed (pos=$pos):")
+    # show(stdout, MIME("text/plain"), node)
+    # println("child:")
+    # show(stdout, MIME("text/plain"), child)
+
+    # println("completions for pos $(string[1:pos])|$(string[nextind(string, pos):end])")
+    # println("completions inc_tag=$(inc_tag)") #  (parsed=$(Meta.parse(partial, raise=false, depwarn=false)))
 
     if !hint # require a tab press for completion of these
         # ?(x, y)TAB lists methods you can call with these objects
@@ -1298,6 +1460,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
         startpos = first(varrange) + 4
         separatorpos = something(findprev(isequal('.'), string, first(varrange)-1), 0)
         name = string[startpos:pos]
+        # println("completing varrange=$varrange name=$name separatorpos=$separatorpos")
         complete_identifiers!(suggestions, context_module, string, name,
                               pos, separatorpos, startpos;
                               shift)
