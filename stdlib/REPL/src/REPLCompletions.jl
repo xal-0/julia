@@ -12,7 +12,7 @@ const CC = Base.Compiler
 using Base.Meta
 using Base: propertynames, something, IdSet
 using Base.Filesystem: _readdirx
-using Base.JuliaSyntax: @K_str, parsestmt, byte_range, children, is_trivia, kind
+using Base.JuliaSyntax: @K_str, @KSet_str, parsestmt, byte_range, children, is_trivia, kind
 
 using ..REPL.LineEdit: NamedCompletion
 using ..REPL.SyntaxUtil: CursorNode, find_parent, seek_pos, char_range, char_last, children_nt, find_delim
@@ -304,9 +304,8 @@ const sorted_keyvals = ["false", "true"]
 complete_keyval!(suggestions::Vector{Completion}, s::String) =
     complete_from_list!(suggestions, KeyvalCompletion, sorted_keyvals, s)
 
-function do_raw_escape(s)
-    # escape_raw_string with delim='`' and ignoring the rule for the ending \
-    return replace(s, r"(\\+)`" => s"\1\\`")
+function do_cmd_escape(s)
+    return Base.escape_raw_string(s, '`')
 end
 function do_shell_escape(s)
     return Base.shell_escape_posixly(s)
@@ -411,7 +410,7 @@ end
 function complete_path(path::AbstractString;
                        use_envpath=false,
                        shell_escape=false,
-                       raw_escape=false,
+                       cmd_escape=false,
                        string_escape=false,
                        contract_user=false)
     @assert !(shell_escape && string_escape)
@@ -458,7 +457,7 @@ function complete_path(path::AbstractString;
     end
 
     matches = ((shell_escape ? do_shell_escape(s) : string_escape ? do_string_escape(s) : s) for s in matches)
-    matches = ((raw_escape ? do_raw_escape(s) : s) for s in matches)
+    matches = ((cmd_escape ? do_cmd_escape(s) : s) for s in matches)
     matches = Completion[PathCompletion(contract_user ? contractuser(s) : s) for s in matches]
     return matches, dir, !isempty(matches)
 end
@@ -561,7 +560,7 @@ function find_start_brace(s::AbstractString; c_start='(', c_end=')')
         end
         braces == 1 && break
     end
-    braces != 1 && return 0:-1, -1
+    braces != 1 && return 1:0, -1
     method_name_end = reverseind(s, i)
     startind = nextind(s, something(findprev(in(non_identifier_chars), s, method_name_end), 0))::Int
     return (startind:lastindex(s), method_name_end)
@@ -983,7 +982,7 @@ function bslash_completions(string::String, pos::Int, hint::Bool=false)
         completions = Completion[BslashCompletion(name, "$(symbol_dict[name]) $name") for name in sort!(collect(namelist))]
         return (true, (completions, slashpos:pos, true))
     end
-    return (false, (Completion[], 0:-1, false))
+    return (false, (Completion[], 1:0, false))
 end
 
 # This needs to be a separate non-inlined function, see #19441
@@ -999,7 +998,7 @@ end
 # Identify an argument being completed in a method call. If the argument is empty, method
 # suggestions will be provided instead of argument completions.
 function identify_possible_method_completion(partial, last_idx)
-    fail = 0:-1, Expr(:nothing), 0:-1, 0
+    fail = 1:0, Expr(:nothing), 1:0, 0
 
     # First, check that the last punctuation is either ',', ';' or '('
     idx_last_punct = something(findprev(x -> ispunct(x) && x != '_' && x != '!', partial, last_idx), 0)::Int
@@ -1030,7 +1029,7 @@ end
 function complete_keyword_argument(partial::String, last_idx::Int, context_module::Module;
                                    shift::Bool=false)
     frange, ex, wordrange, = identify_possible_method_completion(partial, last_idx)
-    fail = Completion[], 0:-1, frange
+    fail = Completion[], 1:0, frange
     ex.head === :call || is_broadcasting_expr(ex) || return fail
 
     kwargs_flag, funct, args_ex, kwargs_ex = _complete_methods(ex, context_module, true)::Tuple{Int, Any, Vector{Any}, Set{Symbol}}
@@ -1091,20 +1090,54 @@ function get_loading_candidates(pkgstarts::String, project_file::String)
     return loading_candidates
 end
 
-function complete_loading_candidates!(suggestions::Vector{Completion}, pkgstarts::String, project_file::String)
-    for name in get_loading_candidates(pkgstarts, project_file)
-        push!(suggestions, PackageCompletion(name))
+function complete_loading_candidates!(suggestions::Vector{Completion}, s::String)
+    for name in ("Core", "Base")
+        startswith(name, s) && push!(suggestions, PackageCompletion(name))
     end
-    return suggestions
+
+    # If there's no dot, we're in toplevel, so we should
+    # also search for packages
+    for dir in Base.load_path()
+        if basename(dir) in Base.project_names && isfile(dir)
+            for name in get_loading_candidates(s, dir)
+                push!(suggestions, PackageCompletion(name))
+            end
+        end
+        isdir(dir) || continue
+        for entry in _readdirx(dir)
+            pname = entry.name
+            if pname[1] != '.' && pname != "METADATA" &&
+                pname != "REQUIRE" && startswith(pname, s)
+                # Valid file paths are
+                #   <Mod>.jl
+                #   <Mod>/src/<Mod>.jl
+                #   <Mod>.jl/src/<Mod>.jl
+                if isfile(entry)
+                    endswith(pname, ".jl") && push!(suggestions,
+                                                    PackageCompletion(pname[1:prevind(pname, end-2)]))
+                else
+                    mod_name = if endswith(pname, ".jl")
+                        pname[1:prevind(pname, end-2)]
+                    else
+                        pname
+                    end
+                    if isfile(joinpath(entry, "src",
+                                       "$mod_name.jl"))
+                        push!(suggestions, PackageCompletion(mod_name))
+                    end
+                end
+            end
+        end
+    end
 end
 
 function completions(string::String, pos::Int, context_module::Module=Main, shift::Bool=true, hint::Bool=false)
-    partial = string[1:thisind(string, pos)]
+    partial = string[1:pos]
     node = parsestmt(CursorNode, string, ignore_errors=true, keep_parens=true)
     cur = @something seek_pos(node, pos) node
 
     # TODO: remove
-    hint && return Completion[], 0:-1, false
+    hint && return Completion[], 1:0, false
     if !hint
         println("\ncompletions for pos=$pos: $(partial)|$(string[nextind(string, pos):end])")
         println("  pos at $(kind(cur))")
@@ -1127,7 +1160,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
         if key.start - 1 <= pos <= key.stop
             obj = dict_eval(Expr(n))
             if obj !== nothing
-                matches = find_dict_matches(obj, string[intersect(key, 1:thisind(string, pos))])
+                matches = find_dict_matches(obj, string[intersect(key, 1:pos)])
                 length(matches) == 1 && !closed && (matches[1] *= ']')
                 length(matches) > 0 &&
                   return Completion[DictCompletion(obj, match) for match in sort!(matches)], key, true
@@ -1140,8 +1173,8 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     #   `file ~/exa TAB          => `file ~/example.txt
     #   `file ~/example.txt TAB  => `file /home/user/example.txt
     if (n = find_parent(cur, K"CmdString")) !== nothing
-        off = prevind(string, n.position)
-        ret, r, success = shell_completions(string[char_range(n)], pos - off, hint, raw_escape=true)
+        off = n.position - 1
+        ret, r, success = shell_completions(string[char_range(n)], pos - off, hint, cmd_escape=true)
         length(ret) > 0 && return ret, r .+ off, success
     end
 
@@ -1152,14 +1185,14 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     empty_str = (n = find_parent(cur, K"\"")) !== nothing && n.index == 1 # Empty start of string
     if lit_str !== nothing || empty_str
         if empty_str
-            str = ""
-            r = char_range(n.parent)
+            s, r = "", char_range(n.parent)
         else
-            # TODO: raw string? (RAW_STRING_FLAG)
-            str = unescape_string(string[char_range(lit_str)])
-            r = char_range(lit_str)
+            s, r = lit_str.val, char_range(lit_str)
         end
-        ret, r, success = string_completions(str, r, hint)
+        ret, success = complete_path_string(s, hint; string_escape=true)
+        if length(ret) == 1 && isfile(ret[1].path)
+            ret[1] = PathCompletion(ret[1].path * '"')
+        end
         return ret, r, success
     end
 
@@ -1174,16 +1207,90 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     #   foo(x, TAB => list of methods signatures for foo with x as first argument
     # TODO
 
-    # comp_keywords = true
-    # complete_modules_only = false
-    # suggestions = Completion[]
-    # complete_identifiers!(suggestions, context_module, spine;
-    # comp_keywords, complete_modules_only, shift)
+    if cur.parent !== nothing && kind(cur.parent) == K"var"
+        # Replace the entire var"foo", but search using only "foo".
+        r = char_range(cur.parent)
+        r2 = char_range(children_nt(cur.parent)[1])
+        s = string[intersect(r2, 1:pos)]
+    elseif kind(cur) in KSet"Identifier @"
+        r = char_range(cur)
+        s = string[intersect(r, 1:pos)]
+    elseif kind(cur) == K"MacroName"
+        # Include the `@`
+        r = prevind(string, cur.position):char_last(cur)
+        s = string[intersect(r, 1:pos)]
+    else
+        # Don't replace anything at the cursor if we aren't on an identifier.
+        r = nextind(string, pos):pos
+        s = ""
+    end
 
-    return Completion[], 0:-1, false
+    suggestions = Completion[]
+    complete_modules_only = false
+    prefix = node_prefix(cur)
+    comp_keywords = prefix === nothing
+
+    # Complete loadable module names:
+    #   import Mod TAB
+    #   import Mod1, Mod2 TAB
+    #   using Mod TAB
+    if (n = find_parent(cur, K"importpath")) !== nothing
+        # Given input lines like `using Foo|`, `import Foo, Bar|` and `using Foo.Bar, Baz, |`:
+        # Let's look only for packages and modules we can reach from here
+        prefix == nothing && complete_loading_candidates!(suggestions, s)
+        # Allow completion for `import Mod.name` (where `name` is not a module)
+        complete_modules_only = prefix == nothing || kind(n.parent) == K"using"
+        comp_keywords = false
+    end
+
+    if comp_keywords
+        complete_keyword!(suggestions, s)
+        complete_keyval!(suggestions, s)
+    end
+
+    complete_symbol!(suggestions, prefix, s, context_module; complete_modules_only, shift)
+    return sort!(unique!(named_completion, suggestions), by=named_completion_completion), r, true
 end
 
-function dict_eval(e, context_module::Module=Main)
+# If node is the field in a getfield-like expression, return the value
+# complete_symbol! should use as the prefix.
+function node_prefix(node::CursorNode)
+    node.parent !== nothing || return nothing
+    p = node.parent
+
+    # expr.node
+    if kind(p) == K"."
+        n = children_nt(p)[1]
+        # Don't use prefix if we are the value
+        n !== node || return nothing
+        return Expr(n)
+    end
+
+    if kind(p) == K"importpath"
+        if p.parent !== nothing && kind(p.parent) == K":" && p.index_nt > 1
+            # import A.B: C.node
+            chain = children_nt(children_nt(p.parent)[1])
+            append!(chain, children_nt(p)[1:end-1])
+        else
+            # import A.node
+            # import A.node: ...
+            cs = children_nt(p)
+            length(cs) > 1 || return nothing
+            chain = cs[1:end-1]
+        end
+
+        # Convert the "chain" into nested (:. a b) expressions.
+        # The cursor should be on the last node
+        good = all(x -> kind(x) == K"Identifier" && x !== node, chain)
+        all(x -> kind(x) == K"Identifier" && x !== node, chain) || return nothing
+        init, chain = chain[1].val, map(x -> Expr(:quote, x.val), chain[2:end])
+        return foldl((x, y) -> Expr(:., x, y), chain; init)
+    end
+
+    nothing
+end
+
+function dict_eval(@nospecialize(e), context_module::Module=Main)
     @assert e.head == :ref
     objt = repl_eval_ex(e.args[1], context_module)
     isa(objt, Core.Const) || return nothing
@@ -1222,18 +1329,18 @@ function method_search(partial::String, context_module::Module, shift::Bool)
     end
 end
 
-function shell_completions(string, pos, hint::Bool=false; raw_escape::Bool=false)
+function shell_completions(string, pos, hint::Bool=false; cmd_escape::Bool=false)
     # First parse everything up to the current position
     scs = string[1:pos]
     args, last_arg_start = try
         Base.shell_parse(scs, true)::Tuple{Expr,Int}
     catch ex
         ex isa ArgumentError || ex isa ErrorException || rethrow()
-        return Completion[], 0:-1, false
+        return Completion[], 1:0, false
     end
     ex = args.args[end]::Expr
     # Now look at the last thing we parsed
-    isempty(ex.args) && return Completion[], 0:-1, false
+    isempty(ex.args) && return Completion[], 1:0, false
     lastarg = ex.args[end]
     # As Base.shell_parse throws away trailing spaces (unless they are escaped),
     # we need to special case here.
@@ -1245,7 +1352,7 @@ function shell_completions(string, pos, hint::Bool=false; raw_escape::Bool=false
         return ret, range, true
     elseif endswith(scs, ' ') && !endswith(scs, "\\ ")
         r = pos+1:pos
-        paths, dir, success = complete_path(""; use_envpath=false, shell_escape=true, raw_escape)
+        paths, dir, success = complete_path(""; use_envpath=false, shell_escape=true, cmd_escape)
         return paths, r, success
     elseif all(@nospecialize(arg) -> arg isa AbstractString, ex.args)
         # Join these and treat this as a path
@@ -1255,7 +1362,7 @@ function shell_completions(string, pos, hint::Bool=false; raw_escape::Bool=false
         # Also try looking into the env path if the user wants to complete the first argument
         use_envpath = length(args.args) < 2
 
-        paths, r, success = complete_path_string(path, r, hint; use_envpath, shell_escape=true, raw_escape)
+        paths, success = complete_path_string(path, hint; use_envpath, shell_escape=true, cmd_escape)
 
         # if ~ was expanded earlier and the incomplete string isn't a path
         # return the path with contracted user to match what the hint shows. Otherwise expand ~
@@ -1267,22 +1374,10 @@ function shell_completions(string, pos, hint::Bool=false; raw_escape::Bool=false
         # end
         return paths, r, success
     end
-    return Completion[], 0:-1, false
+    return Completion[], 1:0, false
 end
 
-function string_completions(string, r, hint::Bool=false)
-    paths, r, success = complete_path_string(string, r, hint; string_escape=true)
-    if length(paths) == 1
-        # close_path_completion(dir, paths[1].path, path, pos)
-        # if close_path_completion(dir, )
-        #     p = (only(paths)::PathCompletion).path
-        #     paths[1] = PathCompletion(p * "\"")
-        # end
-    end
-    return paths, r, success
-end
-
-function complete_path_string(path, r, hint::Bool=false; kws...)
+function complete_path_string(path, hint::Bool=false; kws...)
     # Expand "~" and remember if we expanded it.
     local expanded
     try
@@ -1297,16 +1392,17 @@ function complete_path_string(path, r, hint::Bool=false; kws...)
 
     # If tab press, ispath and user expansion available, return it now
     # otherwise see if we can complete the path further before returning with expanded ~
-    expanded && !hint && ispath(path) && return Completion[PathCompletion(path)], r, true
+    expanded && !hint && ispath(path) && return Completion[PathCompletion(path)], true
 
     paths, dir, success = complete_path(path; contract_user=expanded, kws...)
 
-    # TODO: why !isempty(dir)? -- don't add trailing slash if not exists?
-    # TODO: escaping of dir matches input?
-    if dir != "" && !endswith(dir, "/")
-        dir *= "/"
+    expanded && (dir = contractuser(dir))
+    dir != "" && !endswith(dir, "/") && (dir *= "/")
+    map!(paths) do c::PathCompletion
+        p = dir * c.path
+        PathCompletion(p)
     end
-    return sort!([PathCompletion(dir * c.path) for c in paths], by=p->p.path), r, success
+    return sort!(paths, by=p->p.path), success
 end
 
 function __init__()

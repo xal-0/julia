@@ -438,7 +438,6 @@ function check_show_hint(s::MIState)
         next_key_pressed() && return
         @lock s.hint_generation_lock begin
             next_key_pressed() && return
-            # TODO: partial to range
             named_completions, reg, should_complete = try
                 complete_line_named(st.p.complete, st, s.active_module; hint = true)
             catch
@@ -500,7 +499,6 @@ function clear_hint(s::ModeState)
 end
 
 function complete_line(s::PromptState, repeats::Int, mod::Module; hint::Bool=false)
-    # TODO: partial to range
     completions, reg, should_complete = complete_line_named(s.p.complete, s, mod; hint)
     isempty(completions) && return false
     if !should_complete
@@ -513,7 +511,7 @@ function complete_line(s::PromptState, repeats::Int, mod::Module; hint::Bool=fal
         edit_splice!(s, reg, completions[1].completion)
     else
         p = common_prefix(completions)
-        partial = content(s, reg.first => reg.first+sizeof(p))
+        partial = content(s, reg)
         if !isempty(p) && p != partial
             # All possible completions share the same prefix, so we might as
             # well complete that.
@@ -839,7 +837,6 @@ function edit_move_right(m::MIState)
         refresh_line(s)
         return true
     else
-        # TODO: partial to range
         completions, reg, should_complete = complete_line(s.p.complete, s, m.active_module)
         if should_complete && eof(buf) && length(completions) == 1 && reg.second - reg.first > 1
             # Replace word by completion
@@ -2265,7 +2262,6 @@ setmodifiers!(c) = nothing
 
 # Search Mode completions
 function complete_line(s::SearchState, repeats, mod::Module; hint::Bool=false)
-    # TODO: partial to range
     completions, reg, should_complete = complete_line(s.histprompt.complete, s, mod; hint)
     # For now only allow exact completions in search mode
     if length(completions) == 1

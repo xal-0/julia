@@ -2,19 +2,21 @@ module SyntaxUtil
 
 import Base.JuliaSyntax: build_tree
 using Base.JuliaSyntax:
-    AbstractSyntaxData, GreenNode, ParseStream, SourceFile, SyntaxHead, SyntaxNode, TreeNode,
-    _unsafe_wrap_substring, byte_range, children, first_byte, is_leaf, is_trivia, kind, span
+    AbstractSyntaxData, GreenNode, Kind, ParseStream, SourceFile, SyntaxHead, SyntaxNode, TreeNode,
+    _unsafe_wrap_substring, byte_range, children, first_byte, head, is_leaf, is_trivia, kind, span,
+    parse_julia_literal
 
 export CursorNode, char_range, char_last, children_nt, find_delim, seek_pos
 
-# Similar to SyntaxNode, but keeps trivia, tracks each child's location in its
-# parent, and doesn't parse literals.
+# Like SyntaxNode, but keeps trivia, and tracks each child's index in its parent.
 # Code extracted from JuliaSyntax/src/syntax_tree.jl
 struct CursorData <: AbstractSyntaxData
     source::SourceFile
     raw::GreenNode{SyntaxHead}
     position::Int
     index::Int
+    index_nt::Int # nth non-trivia in parent
+    val::Any
 end
 
 const CursorNode = TreeNode{CursorData}
@@ -30,17 +32,21 @@ end
 
 function _to_CursorNode(source::SourceFile, txtbuf::Vector{UInt8}, offset::Int,
                         raw::GreenNode{SyntaxHead},
-                        position::Int, index::Int=-1)
+                        position::Int, index::Int=-1, index_nt::Int=-1)
     if is_leaf(raw)
-        return CursorNode(nothing, nothing, CursorData(source, raw, position, index))
+        valrange = position:position + span(raw) - 1
+        val = parse_julia_literal(txtbuf, head(raw), valrange .+ offset)
+        return CursorNode(nothing, nothing, CursorData(source, raw, position, index, index_nt, val))
     else
         cs = CursorNode[]
         pos = position
+        i_nt = 1
         for (i,rawchild) in enumerate(children(raw))
-            push!(cs, _to_CursorNode(source, txtbuf, offset, rawchild, pos, i))
+            push!(cs, _to_CursorNode(source, txtbuf, offset, rawchild, pos, i, i_nt))
             pos += Int(rawchild.span)
+            i_nt += !is_trivia(rawchild)
         end
-        node = CursorNode(nothing, cs, CursorData(source, raw, position, index))
+        node = CursorNode(nothing, cs, CursorData(source, raw, position, index, index_nt, nothing))
         for c in cs
             c.parent = node
         end
@@ -76,8 +82,9 @@ function seek_pos(node, pos)
     node
 end
 
-function find_parent(node, k)
-    while node !== nothing && kind(node) !== k
+find_parent(node, k::Kind) = find_parent(node, n -> kind(n) == k)
+function find_parent(node, f::Function)
+    while node !== nothing && !f(node)
         node = node.parent
     end
     node
