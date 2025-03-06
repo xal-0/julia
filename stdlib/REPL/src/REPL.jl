@@ -783,30 +783,28 @@ end
 
 beforecursor(buf::IOBuffer) = String(buf.data[1:buf.ptr-1])
 
+# Convert inclusive-inclusive 1-based char indexing to inclusive-exclusuive byte Region.
+to_region(s, r) = first(r)-1 => nextind(s, last(r))-1
+
 function complete_line(c::REPLCompletionProvider, s::PromptState, mod::Module; hint::Bool=false)
     full = LineEdit.input_string(s)
-    ret, range, should_complete = completions(full, position(s), mod, c.modifiers.shift, hint)
-    # print("\n\nrange = $range ")
-    range = first(range)-1 => last(range)
-    # print(" new range = $range\n\n")
+    ret, range, should_complete = completions(full, thisind(full, position(s)), mod, c.modifiers.shift, hint)
+    range = to_region(full, range)
     c.modifiers = LineEdit.Modifiers()
     return unique!(LineEdit.NamedCompletion[named_completion(x) for x in ret]), range, should_complete
 end
 
 function complete_line(c::ShellCompletionProvider, s::PromptState; hint::Bool=false)
-    # First parse everything up to the current position
     full = LineEdit.input_string(s)
-    ret, range, should_complete = shell_completions(full, position(s), hint)
-    # range = length(range) > 0 ? (first(range)-1 => last(range)) : (first(range)-1 => first(range)-1)
-    range = first(range)-1 => last(range)
+    ret, range, should_complete = shell_completions(full, thisind(full, position(s)), hint)
+    range = to_region(full, range)
     return unique!(LineEdit.NamedCompletion[named_completion(x) for x in ret]), range, should_complete
 end
 
 function complete_line(c::LatexCompletions, s; hint::Bool=false)
     full = LineEdit.input_string(s)::String
-    ret, range, should_complete = bslash_completions(full, position(s), hint)[2]
-    # range = length(range) > 0 ? (first(range)-1 => last(range)) : (first(range)-1 => first(range)-1)
-    range = first(range)-1 => last(range)
+    ret, range, should_complete = bslash_completions(full, thisind(full, position(s)), hint)[2]
+    range = to_region(full, range)
     return unique!(LineEdit.NamedCompletion[named_completion(x) for x in ret]), range, should_complete
 end
 
