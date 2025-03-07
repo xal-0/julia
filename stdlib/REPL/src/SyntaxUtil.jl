@@ -3,13 +3,14 @@ module SyntaxUtil
 import Base.JuliaSyntax: build_tree
 using Base.JuliaSyntax:
     AbstractSyntaxData, GreenNode, Kind, ParseStream, SourceFile, SyntaxHead, SyntaxNode, TreeNode,
-    _unsafe_wrap_substring, byte_range, children, first_byte, head, is_leaf, is_trivia, kind, span,
-    parse_julia_literal
+    byte_range, children, first_byte, head, is_leaf, is_trivia, kind, parse_julia_literal, span,
+    _unsafe_wrap_substring
 
 export CursorNode, char_range, char_last, children_nt, find_delim, seek_pos
 
 # Like SyntaxNode, but keeps trivia, and tracks each child's index in its parent.
-# Code extracted from JuliaSyntax/src/syntax_tree.jl
+# Extracted from JuliaSyntax/src/syntax_tree.jl
+# TODO: don't duplicate so much code?
 struct CursorData <: AbstractSyntaxData
     source::SourceFile
     raw::GreenNode{SyntaxHead}

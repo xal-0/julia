@@ -12,7 +12,7 @@ const CC = Base.Compiler
 using Base.Meta
 using Base: propertynames, something, IdSet
 using Base.Filesystem: _readdirx
-using Base.JuliaSyntax: @K_str, @KSet_str, parsestmt, byte_range, children, is_trivia, kind
+using Base.JuliaSyntax: @K_str, @KSet_str, parsestmt, byte_range, children, is_prefix_call, is_trivia, kind
 
 using ..REPL.LineEdit: NamedCompletion
 using ..REPL.SyntaxUtil: CursorNode, find_parent, seek_pos, char_range, char_last, children_nt, find_delim
@@ -1132,13 +1132,15 @@ function complete_loading_candidates!(suggestions::Vector{Completion}, s::String
 end
 
 function completions(string::String, pos::Int, context_module::Module=Main, shift::Bool=true, hint::Bool=false)
-    partial = string[1:pos]
     node = parsestmt(CursorNode, string, ignore_errors=true, keep_parens=true)
-    cur = @something seek_pos(node, pos) node
+    # Back up before whitespace to get a more useful AST node
+    pos_not_ws = findprev(!isspace, string, pos)
+    cur = @something seek_pos(node, pos_not_ws) node
 
     # TODO: remove
     hint && return Completion[], 1:0, false
     if !hint
+        partial = @view string[1:pos]
         println("\ncompletions for pos=$pos: $(partial)|$(string[nextind(string, pos):end])")
         println("  pos at $(kind(cur))")
         show(stdout, MIME("text/plain"), node)
@@ -1149,7 +1151,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     #   ?(x, y TAB           lists methods that take these objects as the first two arguments
     #   MyModule.?(x, y)TAB  restricts the search to names in MyModule
     if !hint
-        cs = method_search(partial, context_module, shift)
+        cs = method_search(view(string, 1:pos), context_module, shift)
         cs !== nothing && return cs
     end
 
@@ -1203,9 +1205,32 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     ok && return ret
 
     # Method completion:
-    #   foo( TAB   => list of method signatures for foo
-    #   foo(x, TAB => list of methods signatures for foo with x as first argument
-    # TODO
+    #   foo( TAB     => list of method signatures for foo
+    #   foo(x, TAB   => list of methods signatures for foo with x as first argument
+    # TODO: allow method completion using arguments past the cursor?
+    inside_call, inside_params = false, false
+    if (n = cur.parent) !== nothing
+        inside_params = kind(n) == K"parameters"
+        inside_params && (n = n.parent)
+        inside_call = n !== nothing && kind(n) in KSet"call dotcall" && is_prefix_call(n)
+        inside_call &= inside_params || cur.index_nt > 1
+    end
+    if inside_call && kind(cur) in KSet"( , ;"
+        e = Expr(n)
+        # Remove arguments after the cursor
+        print("before removing "); Meta.show_sexpr(e); println()
+        i = inside_params ? cur.parent.index_nt + cur.index_nt - 1 : cur.index_nt
+        if kind(n) == K"dotcall" # dotcall becomes (:., :func, (:tuple, ...))
+            e.args[2].args = e.args[2].args[1:i-2]
+        else
+            e.args = e.args[1:i-1]
+        end
+        print("after removing  "); Meta.show_sexpr(e); println()
+        return complete_methods(e, context_module, shift), 1:0, false
+    end
+
+    # TODO: keyword argument completion
+    
 
     if cur.parent !== nothing && kind(cur.parent) == K"var"
         # Replace the entire var"foo", but search using only "foo".
@@ -1300,7 +1325,7 @@ function dict_eval(@nospecialize(e), context_module::Module=Main)
     return obj
 end
 
-function method_search(partial::String, context_module::Module, shift::Bool)
+function method_search(partial::AbstractString, context_module::Module, shift::Bool)
     rexm = match(r"(\w+\.|)\?\((.*)$", partial)
     if rexm !== nothing
         # Get the module scope
