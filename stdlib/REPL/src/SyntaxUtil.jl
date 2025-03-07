@@ -71,7 +71,7 @@ Base.Expr(node::CursorNode) =
 char_range(node) = node.position:char_last(node)
 char_last(node) = thisind(node.source, node.position + span(node) - 1)
 
-children_nt(node) = collect(filter(!is_trivia, children(node)))
+children_nt(node) = [n for n in children(node) if !is_trivia(n)]
 
 function seek_pos(node, pos)
     pos in byte_range(node) || return nothing
@@ -96,12 +96,13 @@ end
 # if the right delimiter is missing.
 function find_delim(node, left_kind, right_kind)
     cs = children(node)
-    left = first(c.position for c in cs if kind(c) == left_kind)
-    left = nextind(node.source, left)
+    left = findfirst(c -> kind(c) == left_kind, cs)
+    left !== nothing || return nothing, nothing
     right = findlast(c -> kind(c) == right_kind, cs)
-    found = right !== nothing
-    right = found ? char_last(cs[right-1]) : char_last(node)
-    return left:right, found
+    closed = right !== nothing && right != left
+    right = closed ? thisind(node.source, cs[right].position - 1) : char_last(node)
+    left = nextind(node.source, char_last(cs[left]))
+    return left:right, closed
 end
 
 end
