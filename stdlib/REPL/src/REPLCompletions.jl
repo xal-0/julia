@@ -491,81 +491,6 @@ function complete_path(path::AbstractString,
     return paths, startpos:pos, success
 end
 
-# Returns a range that includes the method name in front of the first non
-# closed start brace from the end of the string.
-function find_start_brace(s::AbstractString; c_start='(', c_end=')')
-    r = reverse(s)
-    i = firstindex(r)
-    braces = in_comment = 0
-    in_single_quotes = in_double_quotes = in_back_ticks = false
-    num_single_quotes_in_string = count('\'', s)
-    while i <= ncodeunits(r)
-        c, i = iterate(r, i)
-        if c == '#' && i <= ncodeunits(r) && iterate(r, i)[1] == '='
-            c, i = iterate(r, i) # consume '='
-            new_comments = 1
-            # handle #=#=#=#, by counting =# pairs
-            while i <= ncodeunits(r) && iterate(r, i)[1] == '#'
-                c, i = iterate(r, i) # consume '#'
-                iterate(r, i)[1] == '=' || break
-                c, i = iterate(r, i) # consume '='
-                new_comments += 1
-            end
-            if c == '='
-                in_comment += new_comments
-            else
-                in_comment -= new_comments
-            end
-        elseif !in_single_quotes && !in_double_quotes && !in_back_ticks && in_comment == 0
-            if c == c_start
-                braces += 1
-            elseif c == c_end
-                braces -= 1
-            elseif c == '\'' && num_single_quotes_in_string % 2 == 0
-                # ' can be a transpose too, so check if there are even number of 's in the string
-                # TODO: This probably needs to be more robust
-                in_single_quotes = true
-            elseif c == '"'
-                in_double_quotes = true
-            elseif c == '`'
-                in_back_ticks = true
-            end
-        else
-            if in_single_quotes &&
-                c == '\'' && i <= ncodeunits(r) && iterate(r, i)[1] != '\\'
-                in_single_quotes = false
-            elseif in_double_quotes &&
-                c == '"' && i <= ncodeunits(r) && iterate(r, i)[1] != '\\'
-                in_double_quotes = false
-            elseif in_back_ticks &&
-                c == '`' && i <= ncodeunits(r) && iterate(r, i)[1] != '\\'
-                in_back_ticks = false
-            elseif in_comment > 0 &&
-                c == '=' && i <= ncodeunits(r) && iterate(r, i)[1] == '#'
-                # handle =#=#=#=, by counting #= pairs
-                c, i = iterate(r, i) # consume '#'
-                old_comments = 1
-                while i <= ncodeunits(r) && iterate(r, i)[1] == '='
-                    c, i = iterate(r, i) # consume '='
-                    iterate(r, i)[1] == '#' || break
-                    c, i = iterate(r, i) # consume '#'
-                    old_comments += 1
-                end
-                if c == '#'
-                    in_comment -= old_comments
-                else
-                    in_comment += old_comments
-                end
-            end
-        end
-        braces == 1 && break
-    end
-    braces != 1 && return 1:0, -1
-    method_name_end = reverseind(s, i)
-    startind = nextind(s, something(findprev(in(non_identifier_chars), s, method_name_end), 0))::Int
-    return (startind:lastindex(s), method_name_end)
-end
-
 struct REPLCacheToken end
 
 struct REPLInterpreter <: CC.AbstractInterpreter
@@ -926,35 +851,6 @@ const subscript_regex = Regex("^\\\\_[" * join(isdigit(k) || isletter(k) ? "$k" 
 const superscripts = Dict(k[3]=>v[1] for (k,v) in latex_symbols if startswith(k, "\\^") && length(k)==3)
 const superscript_regex = Regex("^\\\\\\^[" * join(isdigit(k) || isletter(k) ? "$k" : "\\$k" for k in keys(superscripts)) * "]+\\z")
 
-# Aux function to detect whether we're right after a using or import keyword
-function get_import_mode(s::String, pos::Int)
-    # Capture group 1 will be returned, group 2 is where the cursor should be.
-    function match_pos(re)
-        for m in eachmatch(re, s, overlap=true)
-            m !== nothing || continue
-            pos in range(m.offsets[2], length=sizeof(m[2])) || continue
-            return m[1]
-        end
-    end
-
-    # match module import statements like `using |`, `import |`, `using Foo|`, `import Foo, Bar|` and `using Foo.Bar, Baz, |`
-    m = match_pos(r"\b(using|import)(\s+(?:[\w\.]+(?:\s*,\s*[\w\.]+)*(:?\s*,)?\s*)?)")
-    m !== nothing && return m == "using" ? :using_module : :import_module
-
-    # now match explicit name import statements like `using Foo: |` and `import Foo: bar, baz|`
-    m = match_pos(r"\b(using|import)\s+(?:[\w\.]+(?:\s*,\s*[\w\.]+)*)\s*(:\s*(?:[\w@!\s,]+)*)")
-    m !== nothing && return m == "using" ? :using_name : :import_name
-end
-
-function close_path_completion(dir, path, str, pos)
-    path = unescape_string(replace(path, "\\\$"=>"\$"))
-    path = joinpath(dir, path)
-    # ...except if it's a directory...
-    Base.isaccessibledir(path) && return false
-    # ...and except if there's already a " at the cursor.
-    return lastindex(str) <= pos || str[nextind(str, pos)] != '"'
-end
-
 function bslash_completions(string::String, pos::Int, hint::Bool=false)
     slashpos = something(findprev(isequal('\\'), string, pos), 0)
     if (something(findprev(in(bslash_separators), string, pos), 0) < slashpos &&
@@ -993,85 +889,6 @@ end
         startswith(rkey,partial_key) && push!(matches,rkey)
     end
     return matches
-end
-
-# Identify an argument being completed in a method call. If the argument is empty, method
-# suggestions will be provided instead of argument completions.
-function identify_possible_method_completion(partial, last_idx)
-    fail = 1:0, Expr(:nothing), 1:0, 0
-
-    # First, check that the last punctuation is either ',', ';' or '('
-    idx_last_punct = something(findprev(x -> ispunct(x) && x != '_' && x != '!', partial, last_idx), 0)::Int
-    idx_last_punct == 0 && return fail
-    last_punct = partial[idx_last_punct]
-    last_punct == ',' || last_punct == ';' || last_punct == '(' || return fail
-
-    # Then, check that `last_punct` is only followed by an identifier or nothing
-    before_last_word_start = something(findprev(in(non_identifier_chars), partial, last_idx), 0)
-    before_last_word_start == 0 && return fail
-    all(isspace, @view partial[nextind(partial, idx_last_punct):before_last_word_start]) || return fail
-
-    # Check that `last_punct` is either the last '(' or placed after a previous '('
-    frange, method_name_end = find_start_brace(@view partial[1:idx_last_punct])
-    method_name_end ∈ frange || return fail
-
-    # Strip the preceding ! operators, if any, and close the expression with a ')'
-    s = replace(partial[frange], r"\G\!+([^=\(]+)" => s"\1"; count=1) * ')'
-    ex = Meta.parse(s, raise=false, depwarn=false)
-    isa(ex, Expr) || return fail
-
-    # `wordrange` is the position of the last argument to complete
-    wordrange = nextind(partial, before_last_word_start):last_idx
-    return frange, ex, wordrange, method_name_end
-end
-
-# Provide completion for keyword arguments in function calls
-function complete_keyword_argument(partial::String, last_idx::Int, context_module::Module;
-                                   shift::Bool=false)
-    frange, ex, wordrange, = identify_possible_method_completion(partial, last_idx)
-    fail = Completion[], 1:0, frange
-    ex.head === :call || is_broadcasting_expr(ex) || return fail
-
-    kwargs_flag, funct, args_ex, kwargs_ex = _complete_methods(ex, context_module, true)::Tuple{Int, Any, Vector{Any}, Set{Symbol}}
-    kwargs_flag == 2 && return fail # one of the previous kwargs is invalid
-
-    methods = Completion[]
-    complete_methods!(methods, funct, Any[Vararg{Any}], kwargs_ex, shift ? -1 : MAX_METHOD_COMPLETIONS, kwargs_flag == 1)
-    # TODO: use args_ex instead of Any[Vararg{Any}] and only provide kwarg completion for
-    # method calls compatible with the current arguments.
-
-    # For each method corresponding to the function call, provide completion suggestions
-    # for each keyword that starts like the last word and that is not already used
-    # previously in the expression. The corresponding suggestion is "kwname=".
-    # If the keyword corresponds to an existing name, also include "kwname" as a suggestion
-    # since the syntax "foo(; kwname)" is equivalent to "foo(; kwname=kwname)".
-    last_word = partial[wordrange] # the word to complete
-    kwargs = Set{String}()
-    for m in methods
-        # if MAX_METHOD_COMPLETIONS is hit a single TextCompletion is return by complete_methods! with an explanation
-        # which can be ignored here
-        m isa TextCompletion && continue
-        m::MethodCompletion
-        possible_kwargs = Base.kwarg_decl(m.method)
-        current_kwarg_candidates = String[]
-        for _kw in possible_kwargs
-            kw = String(_kw)
-            if !endswith(kw, "...") && startswith(kw, last_word) && _kw ∉ kwargs_ex
-                push!(current_kwarg_candidates, kw)
-            end
-        end
-        union!(kwargs, current_kwarg_candidates)
-    end
-
-    suggestions = Completion[KeywordArgumentCompletion(kwarg) for kwarg in kwargs]
-
-    # Only add these if not in kwarg space. i.e. not in `foo(; `
-    if kwargs_flag == 0
-        complete_symbol!(suggestions, #=prefix=#nothing, last_word, context_module; shift)
-        complete_keyval!(suggestions, last_word)
-    end
-
-    return sort!(suggestions, by=named_completion_completion), wordrange
 end
 
 function get_loading_candidates(pkgstarts::String, project_file::String)
@@ -1157,15 +974,15 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
 
     # Complete keys in a Dict:
     #   my_dict[ TAB
-    if (n = find_parent(cur, K"ref")) !== nothing
-        key, closed = find_delim(n, K"[", K"]")
-        if key.start - 1 <= pos <= key.stop
-            obj = dict_eval(Expr(n))
-            if obj !== nothing
-                matches = find_dict_matches(obj, string[intersect(key, 1:pos)])
-                length(matches) == 1 && !closed && (matches[1] *= ']')
-                length(matches) > 0 &&
-                  return Completion[DictCompletion(obj, match) for match in sort!(matches)], key, true
+    n, key, closed = inside_ref(cur, pos)
+    if n !== nothing
+        obj = dict_eval(Expr(n))
+        if obj !== nothing
+            matches = find_dict_matches(obj, string[intersect(key, 1:pos)])
+            length(matches) == 1 && !closed && (matches[1] *= ']')
+            if length(matches) > 0
+                ret = Completion[DictCompletion(obj, match) for match in sort!(matches)]
+                return ret, key, true
             end
         end
     end
@@ -1183,16 +1000,10 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     # Complete ordinary strings:
     #  "~/exa TAB         => "~/example.txt"
     #  "~/example.txt TAB => "/home/user/example.txt"
-    lit_str = find_parent(cur, K"String") # Literal part of string (not $ interpolation)
-    empty_str = (n = find_parent(cur, K"\"")) !== nothing && n.index == 1 # Empty start of string
-    if lit_str !== nothing || empty_str
-        if empty_str
-            s, r = "", char_range(n.parent)
-        else
-            s, r = lit_str.val, char_range(lit_str)
-        end
-        ret, success = complete_path_string(s, hint; string_escape=true)
-        if length(ret) == 1 && isfile(ret[1].path)
+    r, closed = inside_str(cur)
+    if r !== nothing
+        ret, success = complete_path_string(string[r], hint; string_escape=true)
+        if length(ret) == 1 && !closed && close_path_completion(ret[1].path)
             ret[1] = PathCompletion(ret[1].path * '"')
         end
         return ret, r, success
@@ -1210,27 +1021,32 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     # TODO: allow method completion using arguments past the cursor?
     inside_call, inside_params = false, false
     if (n = cur.parent) !== nothing
+        # (call func ...)
+        # (call func ... (parameters ...))
         inside_params = kind(n) == K"parameters"
         inside_params && (n = n.parent)
         inside_call = n !== nothing && kind(n) in KSet"call dotcall" && is_prefix_call(n)
         inside_call &= inside_params || cur.index_nt > 1
     end
+    # Don't provide method completions unless the cursor is after: '(' ',' ';'
     if inside_call && kind(cur) in KSet"( , ;"
         e = Expr(n)
         # Remove arguments after the cursor
-        print("before removing "); Meta.show_sexpr(e); println()
         i = inside_params ? cur.parent.index_nt + cur.index_nt - 1 : cur.index_nt
         if kind(n) == K"dotcall" # dotcall becomes (:., :func, (:tuple, ...))
             e.args[2].args = e.args[2].args[1:i-2]
         else
             e.args = e.args[1:i-1]
         end
-        print("after removing  "); Meta.show_sexpr(e); println()
-        return complete_methods(e, context_module, shift), 1:0, false
+        # return complete_methods(e, context_module, shift), 1:0, false
     end
 
-    # TODO: keyword argument completion
-    
+    # Keyword argument completion:
+    # if inside_call && kind(cur)
+    # kwarg_completion, wordrange = complete_keyword_argument(string[1:pos], pos, context_module; shift)
+    # isempty(wordrange) || return kwarg_completion, wordrange, !isempty(kwarg_completion)
+
+    # !hint && println("kwarg_completion=$kwarg_completion, wordrange=$wordrange")
 
     if cur.parent !== nothing && kind(cur.parent) == K"var"
         # Replace the entire var"foo", but search using only "foo".
@@ -1275,6 +1091,32 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
 
     complete_symbol!(suggestions, prefix, s, context_module; complete_modules_only, shift)
     return sort!(unique!(named_completion, suggestions), by=named_completion_completion), r, true
+end
+
+function close_path_completion(path)
+    path = expanduser(path)
+    path = unescape_string(path, "\\\$"=>"\$")
+    !Base.isaccessibledir(path)
+end
+
+# Is the cursor inside the square brackets of a ref expression?  If so, returns:
+# - The ref node
+# - The range of characters for the brackets
+# - A flag indicating if the closing bracket is present
+function inside_ref(cur::CursorNode, pos::Int)
+    n = find_parent(cur, K"ref")
+    n !== nothing || return nothing, nothing, nothing
+    key, closed = find_delim(n, K"[", K"]")
+    first(key) - 1 <= pos <= last(key) || return nothing, nothing, nothing
+    n, key, closed
+end
+
+# If the cursor is in a literal string, return the contents and char range
+# inside the quotes.  Ignores triple strings.
+function inside_str(cur::CursorNode)
+    n = find_parent(cur, K"string")
+    n !== nothing || return nothing, nothing
+    find_delim(n, K"\"", K"\"")
 end
 
 # If node is the field in a getfield-like expression, return the value
@@ -1422,9 +1264,8 @@ function complete_path_string(path, hint::Bool=false; kws...)
     paths, dir, success = complete_path(path; contract_user=expanded, kws...)
 
     expanded && (dir = contractuser(dir))
-    dir != "" && !endswith(dir, "/") && (dir *= "/")
     map!(paths) do c::PathCompletion
-        p = dir * c.path
+        p = joinpath(dir, c.path)
         PathCompletion(p)
     end
     return sort!(paths, by=p->p.path), success
