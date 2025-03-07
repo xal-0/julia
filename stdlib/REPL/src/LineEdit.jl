@@ -463,11 +463,6 @@ function check_show_hint(s::MIState)
                 # incrementing its starting position by as many characters as the input.
                 maxind = lastindex(p)
                 startind = sizeof(content(s, reg))
-                # maxind = ncodeunits(p)
-                # for _ in partial
-                #     startind = nextind(p, startind)
-                #     startind > maxind && break
-                # end
                 if startind ≤ maxind # completion on a complete name returns itself so check that there's something to hint
                     # index of p from which to start providing the hint
                     startind = nextind(p, startind)
@@ -511,12 +506,12 @@ function complete_line(s::PromptState, repeats::Int, mod::Module; hint::Bool=fal
         edit_splice!(s, reg, completions[1].completion)
     else
         p = common_prefix(completions)
-        partial = content(s, reg)
+        partial = content(s, reg.first => reg.first + sizeof(p))
         if !isempty(p) && p != partial
             # All possible completions share the same prefix, so we might as
             # well complete that.
             push_undo(s)
-            edit_splice!(s, reg.first => min(reg.second, position(s)), p)
+            edit_splice!(s, reg, p)
         elseif repeats > 0
             show_completions(s, completions)
         end
