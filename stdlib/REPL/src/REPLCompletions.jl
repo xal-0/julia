@@ -703,6 +703,7 @@ end
 
 function complete_methods(ex_org::Expr, context_module::Module=Main, shift::Bool=false)
     kwargs_flag, funct, args_ex, kwargs_ex = _complete_methods(ex_org, context_module, shift)::Tuple{Int, Any, Vector{Any}, Set{Symbol}}
+    # println("kwargs_flag=$kwargs_flag, funct=$funct, args_ex=$args_ex, kwargs_ex=$kwargs_ex")
     out = Completion[]
     kwargs_flag == 2 && return out # one of the kwargs is invalid
     kwargs_flag == 0 && push!(args_ex, Vararg{Any}) # allow more arguments if there is no semicolon
@@ -891,6 +892,46 @@ end
     return matches
 end
 
+# Provide completion for keyword arguments in function calls
+function complete_keyword_argument!(suggestions::Vector{Completion},
+                                    ex::Expr, last_word::String,
+                                    context_module::Module; shift::Bool=false)
+    kwargs_flag, funct, args_ex, kwargs_ex = _complete_methods(ex, context_module, true)::Tuple{Int, Any, Vector{Any}, Set{Symbol}}
+    kwargs_flag == 2 && return fail # one of the previous kwargs is invalid
+
+    methods = Completion[]
+    complete_methods!(methods, funct, Any[Vararg{Any}], kwargs_ex, shift ? -1 : MAX_METHOD_COMPLETIONS, kwargs_flag == 1)
+    # TODO: use args_ex instead of Any[Vararg{Any}] and only provide kwarg completion for
+    # method calls compatible with the current arguments.
+
+    # For each method corresponding to the function call, provide completion suggestions
+    # for each keyword that starts like the last word and that is not already used
+    # previously in the expression. The corresponding suggestion is "kwname=".
+    # If the keyword corresponds to an existing name, also include "kwname" as a suggestion
+    # since the syntax "foo(; kwname)" is equivalent to "foo(; kwname=kwname)".
+    kwargs = Set{String}()
+    for m in methods
+        # if MAX_METHOD_COMPLETIONS is hit a single TextCompletion is return by complete_methods! with an explanation
+        # which can be ignored here
+        m isa TextCompletion && continue
+        m::MethodCompletion
+        possible_kwargs = Base.kwarg_decl(m.method)
+        current_kwarg_candidates = String[]
+        for _kw in possible_kwargs
+            kw = String(_kw)
+            if !endswith(kw, "...") && startswith(kw, last_word) && _kw ∉ kwargs_ex
+                push!(current_kwarg_candidates, kw)
+            end
+        end
+        union!(kwargs, current_kwarg_candidates)
+    end
+
+    for kwarg in kwargs
+        push!(suggestions, KeywordArgumentCompletion(kwarg))
+    end
+    return kwargs_flag != 0
+end
+
 function get_loading_candidates(pkgstarts::String, project_file::String)
     loading_candidates = String[]
     d = Base.parsed_toml(project_file)
@@ -954,14 +995,8 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     pos_not_ws = findprev(!isspace, string, pos)
     cur = @something seek_pos(node, pos_not_ws) node
 
-    # TODO: remove
-    hint && return Completion[], 1:0, false
-    if !hint
-        partial = @view string[1:pos]
-        println("\ncompletions for pos=$pos: $(partial)|$(string[nextind(string, pos):end])")
-        println("  pos at $(kind(cur))")
-        show(stdout, MIME("text/plain"), node)
-    end
+    suggestions = Completion[]
+    sort_suggestions() = sort!(unique!(named_completion, suggestions), by=named_completion_completion), r, true
 
     # Search for methods (requires tab press):
     #   ?(x, y)TAB           lists methods you can call with these objects
@@ -974,7 +1009,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
 
     # Complete keys in a Dict:
     #   my_dict[ TAB
-    n, key, closed = inside_ref(cur, pos)
+    n, key, closed = find_ref_key(cur, pos)
     if n !== nothing
         obj = dict_eval(Expr(n))
         if obj !== nothing
@@ -1000,7 +1035,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     # Complete ordinary strings:
     #  "~/exa TAB         => "~/example.txt"
     #  "~/example.txt TAB => "/home/user/example.txt"
-    r, closed = inside_str(cur)
+    r, closed = find_str(cur)
     if r !== nothing
         ret, success = complete_path_string(string[r], hint; string_escape=true)
         if length(ret) == 1 && !closed && close_path_completion(ret[1].path)
@@ -1015,38 +1050,30 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     ok, ret = bslash_completions(string, pos)
     ok && return ret
 
-    # Method completion:
-    #   foo( TAB     => list of method signatures for foo
-    #   foo(x, TAB   => list of methods signatures for foo with x as first argument
-    # TODO: allow method completion using arguments past the cursor?
-    inside_call, inside_params = false, false
-    if (n = cur.parent) !== nothing
-        # (call func ...)
-        # (call func ... (parameters ...))
-        inside_params = kind(n) == K"parameters"
-        inside_params && (n = n.parent)
-        inside_call = n !== nothing && kind(n) in KSet"call dotcall" && is_prefix_call(n)
-        inside_call &= inside_params || cur.index_nt > 1
-    end
-    # Don't provide method completions unless the cursor is after: '(' ',' ';'
-    if inside_call && kind(cur) in KSet"( , ;"
+    if (n = find_prefix_call(cur)) !== nothing 
         e = Expr(n)
-        # Remove arguments after the cursor
-        i = inside_params ? cur.parent.index_nt + cur.index_nt - 1 : cur.index_nt
-        if kind(n) == K"dotcall" # dotcall becomes (:., :func, (:tuple, ...))
-            e.args[2].args = e.args[2].args[1:i-2]
-        else
-            e.args = e.args[1:i-1]
+        # Remove arguments past the first parse error (allows unclosed parens)
+        i = findfirst(x -> x isa Expr && x.head == :error, e.args)
+        i !== nothing && (e.args = e.args[1:i-1])
+        
+        # Method completion:
+        #   foo( TAB     => list of method signatures for foo
+        #   foo(x, TAB   => list of methods signatures for foo with x as first argument
+        # TODO: allow method completion using arguments past the cursor?
+        if kind(cur) in KSet"( , ;"
+            # Don't provide method completions unless the cursor is after: '(' ',' ';'
+            return complete_methods(e, context_module, shift), 1:0, false
+
+        # Keyword argument completion:
+        #   foo(ar TAB   => keyword arguments like `arg1=`
+        elseif kind(cur) == K"Identifier"
+            r = char_range(cur)
+            s = string[intersect(r, 1:pos)]
+            # Return without adding more suggestions if kwargs only
+            complete_keyword_argument!(suggestions, e, s, context_module; shift) &&
+                return sort_suggestions()
         end
-        # return complete_methods(e, context_module, shift), 1:0, false
     end
-
-    # Keyword argument completion:
-    # if inside_call && kind(cur)
-    # kwarg_completion, wordrange = complete_keyword_argument(string[1:pos], pos, context_module; shift)
-    # isempty(wordrange) || return kwarg_completion, wordrange, !isempty(kwarg_completion)
-
-    # !hint && println("kwarg_completion=$kwarg_completion, wordrange=$wordrange")
 
     if cur.parent !== nothing && kind(cur.parent) == K"var"
         # Replace the entire var"foo", but search using only "foo".
@@ -1066,7 +1093,6 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
         s = ""
     end
 
-    suggestions = Completion[]
     complete_modules_only = false
     prefix = node_prefix(cur)
     comp_keywords = prefix === nothing
@@ -1090,7 +1116,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     end
 
     complete_symbol!(suggestions, prefix, s, context_module; complete_modules_only, shift)
-    return sort!(unique!(named_completion, suggestions), by=named_completion_completion), r, true
+    return sort_suggestions()
 end
 
 function close_path_completion(path)
@@ -1103,7 +1129,7 @@ end
 # - The ref node
 # - The range of characters for the brackets
 # - A flag indicating if the closing bracket is present
-function inside_ref(cur::CursorNode, pos::Int)
+function find_ref_key(cur::CursorNode, pos::Int)
     n = find_parent(cur, K"ref")
     n !== nothing || return nothing, nothing, nothing
     key, closed = find_delim(n, K"[", K"]")
@@ -1113,10 +1139,20 @@ end
 
 # If the cursor is in a literal string, return the contents and char range
 # inside the quotes.  Ignores triple strings.
-function inside_str(cur::CursorNode)
+function find_str(cur::CursorNode)
     n = find_parent(cur, K"string")
     n !== nothing || return nothing, nothing
     find_delim(n, K"\"", K"\"")
+end
+
+# Is the cursor directly inside of the arguments of a prefix call (no nested
+# expressions)?
+function find_prefix_call(cur::CursorNode)
+    n = cur.parent
+    n !== nothing || return nothing
+    kind(n) == K"parameters" && (n = n.parent)
+    kind(n) in KSet"call dotcall" && is_prefix_call(n) || return nothing
+    n
 end
 
 # If node is the field in a getfield-like expression, return the value
