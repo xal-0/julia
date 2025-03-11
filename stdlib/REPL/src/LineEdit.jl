@@ -394,7 +394,7 @@ end
 # Old complete_line return type: Vector{String},          String, Bool
 # New complete_line return type: NamedCompletion{String}, String, Bool
 #                            OR  NamedCompletion{String}, Region, Bool
-# 
+#
 # due to close coupling of the Pkg ReplExt `complete_line` can still return a vector of strings,
 # so we convert those in this helper
 function complete_line_named(c, s, args...; kwargs...)::Tuple{Vector{NamedCompletion},Region,Bool}

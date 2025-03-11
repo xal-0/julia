@@ -4,7 +4,7 @@ import Base.JuliaSyntax: build_tree
 using Base.JuliaSyntax:
     AbstractSyntaxData, GreenNode, Kind, ParseStream, SourceFile, SyntaxHead, SyntaxNode, TreeNode,
     byte_range, children, first_byte, head, is_leaf, is_trivia, kind, parse_julia_literal, span,
-    _unsafe_wrap_substring
+    @K_str, _unsafe_wrap_substring
 
 export CursorNode, char_range, char_last, children_nt, find_delim, seek_pos
 
@@ -65,8 +65,18 @@ end
 Base.show(io::IO, node::CursorNode) = show(io, MIME("text/plain"), node.raw)
 Base.show(io::IO, mime::MIME{Symbol("text/plain")}, node::CursorNode) = show(io, mime, node.raw)
 
-Base.Expr(node::CursorNode) =
-    Expr(SyntaxNode(SourceFile(node.source[byte_range(node)]), node.raw))
+function Base.Expr(node::CursorNode)
+    # Lowering can misbehave very badly with nested error, so lift it out.
+    node_has_error(node) && return Expr(:error, "")
+    (; filename, first_line) = node.source
+    src = SourceFile(node.source[byte_range(node)]; filename, first_line)
+    Expr(SyntaxNode(src, node.raw))
+end
+
+function node_has_error(node::CursorNode)
+    kind(node) == K"error" && return true
+    node.children !== nothing && any(node_has_error, node.children)
+end
 
 char_range(node) = node.position:char_last(node)
 char_last(node) = thisind(node.source, node.position + span(node) - 1)

@@ -12,7 +12,7 @@ const CC = Base.Compiler
 using Base.Meta
 using Base: propertynames, something, IdSet
 using Base.Filesystem: _readdirx
-using Base.JuliaSyntax: @K_str, @KSet_str, parsestmt, byte_range, children, is_prefix_call, is_trivia, kind
+using Base.JuliaSyntax: @K_str, @KSet_str, parseall, byte_range, children, is_prefix_call, is_trivia, kind
 
 using ..REPL.LineEdit: NamedCompletion
 using ..REPL.SyntaxUtil: CursorNode, find_parent, seek_pos, char_range, char_last, children_nt, find_delim
@@ -694,6 +694,7 @@ code_typed(CC.typeinf, (REPLInterpreter, CC.InferenceState))
 # Method completion on function call expression that look like :(max(1))
 MAX_METHOD_COMPLETIONS::Int = 40
 function _complete_methods(ex_org::Expr, context_module::Module, shift::Bool)
+    isempty(ex_org.args) && return 2, nothing, [], Set{Symbol}()
     funct = repl_eval_ex(ex_org.args[1], context_module)
     funct === nothing && return 2, nothing, [], Set{Symbol}()
     funct = CC.widenconst(funct)
@@ -703,7 +704,7 @@ end
 
 function complete_methods(ex_org::Expr, context_module::Module=Main, shift::Bool=false)
     kwargs_flag, funct, args_ex, kwargs_ex = _complete_methods(ex_org, context_module, shift)::Tuple{Int, Any, Vector{Any}, Set{Symbol}}
-    # println("kwargs_flag=$kwargs_flag, funct=$funct, args_ex=$args_ex, kwargs_ex=$kwargs_ex")
+    # println("ex=$ex_org kwargs_flag=$kwargs_flag, funct=$funct, args_ex=$args_ex, kwargs_ex=$kwargs_ex")
     out = Completion[]
     kwargs_flag == 2 && return out # one of the kwargs is invalid
     kwargs_flag == 0 && push!(args_ex, Vararg{Any}) # allow more arguments if there is no semicolon
@@ -897,7 +898,7 @@ function complete_keyword_argument!(suggestions::Vector{Completion},
                                     ex::Expr, last_word::String,
                                     context_module::Module; shift::Bool=false)
     kwargs_flag, funct, args_ex, kwargs_ex = _complete_methods(ex, context_module, true)::Tuple{Int, Any, Vector{Any}, Set{Symbol}}
-    kwargs_flag == 2 && return fail # one of the previous kwargs is invalid
+    kwargs_flag == 2 && false # one of the previous kwargs is invalid
 
     methods = Completion[]
     complete_methods!(methods, funct, Any[Vararg{Any}], kwargs_ex, shift ? -1 : MAX_METHOD_COMPLETIONS, kwargs_flag == 1)
@@ -990,13 +991,23 @@ function complete_loading_candidates!(suggestions::Vector{Completion}, s::String
 end
 
 function completions(string::String, pos::Int, context_module::Module=Main, shift::Bool=true, hint::Bool=false)
-    node = parsestmt(CursorNode, string, ignore_errors=true, keep_parens=true)
+    # filename needs to be string so macro can be evaluated
+    node = parseall(CursorNode, string, ignore_errors=true, keep_parens=true, filename="none")
     # Back up before whitespace to get a more useful AST node
     pos_not_ws = findprev(!isspace, string, pos)
     cur = @something seek_pos(node, pos_not_ws) node
 
     suggestions = Completion[]
-    sort_suggestions() = sort!(unique!(named_completion, suggestions), by=named_completion_completion), r, true
+    sort_suggestions() = sort!(unique!(named_completion, suggestions), by=named_completion_completion)
+
+  # TODO: remove
+  # hint && return Completion[], 1:0, false
+  # if !hint
+  #     partial = @view string[1:pos]
+  #     println("\ncompletions for pos=$pos: $(partial)|$(string[nextind(string, pos):end])")
+  #     println("  pos at $(kind(cur))")
+  #     show(stdout, MIME("text/plain"), node)
+  # end
 
     # Search for methods (requires tab press):
     #   ?(x, y)TAB           lists methods you can call with these objects
@@ -1011,6 +1022,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     #   my_dict[ TAB
     n, key, closed = find_ref_key(cur, pos)
     if n !== nothing
+        key::UnitRange{Int}
         obj = dict_eval(Expr(n))
         if obj !== nothing
             matches = find_dict_matches(obj, string[intersect(key, 1:pos)])
@@ -1029,7 +1041,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     if (n = find_parent(cur, K"CmdString")) !== nothing
         off = n.position - 1
         ret, r, success = shell_completions(string[char_range(n)], pos - off, hint, cmd_escape=true)
-        length(ret) > 0 && return ret, r .+ off, success
+        success && return ret, r .+ off, success
     end
 
     # Complete ordinary strings:
@@ -1041,7 +1053,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
         if length(ret) == 1 && !closed && close_path_completion(ret[1].path)
             ret[1] = PathCompletion(ret[1].path * '"')
         end
-        return ret, r, success
+        success && return ret, r, success
     end
 
     # Backlash symbols:
@@ -1050,19 +1062,20 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     ok, ret = bslash_completions(string, pos)
     ok && return ret
 
-    if (n = find_prefix_call(cur)) !== nothing 
+    if (n = find_prefix_call(cur)) !== nothing
+        func = first(children_nt(n))
         e = Expr(n)
         # Remove arguments past the first parse error (allows unclosed parens)
         i = findfirst(x -> x isa Expr && x.head == :error, e.args)
         i !== nothing && (e.args = e.args[1:i-1])
-        
+
         # Method completion:
         #   foo( TAB     => list of method signatures for foo
         #   foo(x, TAB   => list of methods signatures for foo with x as first argument
         # TODO: allow method completion using arguments past the cursor?
         if kind(cur) in KSet"( , ;"
             # Don't provide method completions unless the cursor is after: '(' ',' ';'
-            return complete_methods(e, context_module, shift), 1:0, false
+            return complete_methods(e, context_module, shift), char_range(func), false
 
         # Keyword argument completion:
         #   foo(ar TAB   => keyword arguments like `arg1=`
@@ -1071,7 +1084,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
             s = string[intersect(r, 1:pos)]
             # Return without adding more suggestions if kwargs only
             complete_keyword_argument!(suggestions, e, s, context_module; shift) &&
-                return sort_suggestions()
+                return sort_suggestions(), r, true
         end
     end
 
@@ -1087,8 +1100,13 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
         # Include the `@`
         r = prevind(string, cur.position):char_last(cur)
         s = string[intersect(r, 1:pos)]
+    elseif kind(cur) in KSet"toplevel . error"
+        r = nextind(string, pos):pos
+        s = ""
     else
         # Don't replace anything at the cursor if we aren't on an identifier.
+        # TODO: put back completion when empty?, fix `using foo: TAB`
+        # return Completion[], 1:0, false
         r = nextind(string, pos):pos
         s = ""
     end
@@ -1108,6 +1126,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
         # Allow completion for `import Mod.name` (where `name` is not a module)
         complete_modules_only = prefix == nothing || kind(n.parent) == K"using"
         comp_keywords = false
+        # TODO: fix `using foo: bar` prefix
     end
 
     if comp_keywords
@@ -1115,8 +1134,10 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
         complete_keyval!(suggestions, s)
     end
 
+    # !hint && println("\nkeywords? $comp_keywords, modules only? $complete_modules_only, pref=$prefix")
+
     complete_symbol!(suggestions, prefix, s, context_module; complete_modules_only, shift)
-    return sort_suggestions()
+    return sort_suggestions(), r, true
 end
 
 function close_path_completion(path)
@@ -1194,7 +1215,6 @@ function node_prefix(node::CursorNode)
 end
 
 function dict_eval(@nospecialize(e), context_module::Module=Main)
-    @assert e.head == :ref
     objt = repl_eval_ex(e.args[1], context_module)
     isa(objt, Core.Const) || return nothing
     obj = objt.val
