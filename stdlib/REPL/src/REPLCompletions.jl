@@ -313,6 +313,14 @@ end
 function do_string_escape(s)
     return escape_string(s, ('\"','$'))
 end
+function do_string_unescape(s)
+    try
+        unescape_string(replace(s, "\\\$"=>"\$"))
+    catch e
+        e isa ArgumentError || rethrow()
+        s
+    end
+end
 
 const PATH_cache_lock = Base.ReentrantLock()
 const PATH_cache = Set{String}()
@@ -471,6 +479,7 @@ function complete_path(path::AbstractString,
     ## TODO: enable this depwarn once Pkg is fixed
     #Base.depwarn("complete_path with pos argument is deprecated because the return value [2] is incorrect to use", :complete_path)
     paths, dir, success = complete_path(path; use_envpath, shell_escape, string_escape)
+
     if Base.Sys.isunix() && occursin(r"^~(?:/|$)", path)
         # if the path is just "~", don't consider the expanded username as a prefix
         if path == "~"
@@ -645,6 +654,7 @@ end
 
 # lower `ex` and run type inference on the resulting top-level expression
 function repl_eval_ex(@nospecialize(ex), context_module::Module; limit_aggressive_inference::Bool=false)
+    expr_has_error(ex) && return nothing
     if (isexpr(ex, :toplevel) || isexpr(ex, :tuple)) && !isempty(ex.args)
         # get the inference result for the last expression
         ex = ex.args[end]
@@ -920,7 +930,8 @@ function complete_keyword_argument!(suggestions::Vector{Completion},
         current_kwarg_candidates = String[]
         for _kw in possible_kwargs
             kw = String(_kw)
-            if !endswith(kw, "...") && startswith(kw, last_word) && _kw ∉ kwargs_ex
+            # HACK: Should consider removing current arg from AST.
+            if !endswith(kw, "...") && startswith(kw, last_word) && (_kw ∉ kwargs_ex || kw == last_word)
                 push!(current_kwarg_candidates, kw)
             end
         end
@@ -993,21 +1004,23 @@ end
 function completions(string::String, pos::Int, context_module::Module=Main, shift::Bool=true, hint::Bool=false)
     # filename needs to be string so macro can be evaluated
     node = parseall(CursorNode, string, ignore_errors=true, keep_parens=true, filename="none")
-    # Back up before whitespace to get a more useful AST node
+    cur = @something seek_pos(node, pos) node
+
+    # Back up before whitespace to get a more useful AST node.
     pos_not_ws = findprev(!isspace, string, pos)
-    cur = @something seek_pos(node, pos_not_ws) node
+    cur_not_ws = @something seek_pos(node, pos_not_ws) node
 
     suggestions = Completion[]
     sort_suggestions() = sort!(unique!(named_completion, suggestions), by=named_completion_completion)
 
-  # TODO: remove
-  # hint && return Completion[], 1:0, false
-  # if !hint
-  #     partial = @view string[1:pos]
-  #     println("\ncompletions for pos=$pos: $(partial)|$(string[nextind(string, pos):end])")
-  #     println("  pos at $(kind(cur))")
-  #     show(stdout, MIME("text/plain"), node)
-  # end
+    # TODO: remove
+    # hint && return Completion[], 1:0, false
+    # if !hint
+    #     partial = @view string[1:pos]
+    #     println("\ncompletions for pos=$pos: $(partial)|$(string[nextind(string, pos):end])")
+    #     println("  pos at $(kind(cur))")
+    #     show(stdout, MIME("text/plain"), node)
+    # end
 
     # Search for methods (requires tab press):
     #   ?(x, y)TAB           lists methods you can call with these objects
@@ -1020,12 +1033,16 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
 
     # Complete keys in a Dict:
     #   my_dict[ TAB
-    n, key, closed = find_ref_key(cur, pos)
+    n, key, closed = find_ref_key(cur_not_ws, pos)
     if n !== nothing
         key::UnitRange{Int}
         obj = dict_eval(Expr(n))
         if obj !== nothing
-            matches = find_dict_matches(obj, string[intersect(key, 1:pos)])
+            # Skip leading whitespace inside brackets.
+            i = @something findnext(!isspace, string, first(key)) nextind(string, last(key))
+            key = i:last(key)
+            s = string[intersect(key, 1:pos)]
+            matches = find_dict_matches(obj, s)
             length(matches) == 1 && !closed && (matches[1] *= ']')
             if length(matches) > 0
                 ret = Completion[DictCompletion(obj, match) for match in sort!(matches)]
@@ -1049,7 +1066,8 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     #  "~/example.txt TAB => "/home/user/example.txt"
     r, closed = find_str(cur)
     if r !== nothing
-        ret, success = complete_path_string(string[r], hint; string_escape=true)
+        s = do_string_unescape(string[r])
+        ret, success = complete_path_string(s, hint; string_escape=true)
         if length(ret) == 1 && !closed && close_path_completion(ret[1].path)
             ret[1] = PathCompletion(ret[1].path * '"')
         end
@@ -1062,7 +1080,12 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     ok, ret = bslash_completions(string, pos)
     ok && return ret
 
-    if (n = find_prefix_call(cur)) !== nothing
+    # Don't fall back to symbol completion inside strings or comments.
+    inside_str = find_parent(cur, K"string") !== nothing || find_parent(cur, K"cmdstring") !== nothing
+    (kind(cur) in KSet"Comment ErrorEofMultiComment" || inside_str) &&
+         return Completion[], 1:0, false
+
+    if (n = find_prefix_call(cur_not_ws)) !== nothing
         func = first(children_nt(n))
         e = Expr(n)
         # Remove arguments past the first parse error (allows unclosed parens)
@@ -1073,7 +1096,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
         #   foo( TAB     => list of method signatures for foo
         #   foo(x, TAB   => list of methods signatures for foo with x as first argument
         # TODO: allow method completion using arguments past the cursor?
-        if kind(cur) in KSet"( , ;"
+        if kind(cur_not_ws) in KSet"( , ;"
             # Don't provide method completions unless the cursor is after: '(' ',' ';'
             return complete_methods(e, context_module, shift), char_range(func), false
 
@@ -1088,6 +1111,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
         end
     end
 
+    # Symbol completion
     if cur.parent !== nothing && kind(cur.parent) == K"var"
         # Replace the entire var"foo", but search using only "foo".
         r = char_range(cur.parent)
@@ -1142,8 +1166,15 @@ end
 
 function close_path_completion(path)
     path = expanduser(path)
-    path = unescape_string(path, "\\\$"=>"\$")
+    path = do_string_unescape(path)
     !Base.isaccessibledir(path)
+end
+
+# Lowering can misbehave with nested error expressions.
+function expr_has_error(@nospecialize(e))
+    e isa Expr || return false
+    e.head === :error &&  return true
+    any(expr_has_error, e.args)
 end
 
 # Is the cursor inside the square brackets of a ref expression?  If so, returns:
@@ -1286,21 +1317,16 @@ function shell_completions(string, pos, hint::Bool=false; cmd_escape::Bool=false
         use_envpath = length(args.args) < 2
 
         paths, success = complete_path_string(path, hint; use_envpath, shell_escape=true, cmd_escape)
-
-        # if ~ was expanded earlier and the incomplete string isn't a path
-        # return the path with contracted user to match what the hint shows. Otherwise expand ~
-        # i.e. require two tab presses to expand user
-        # if was_expanded && !ispath(path)
-        #     map!(paths, paths) do c::PathCompletion
-        #         PathCompletion(contractuser(c.path))
-        #     end
-        # end
         return paths, r, success
     end
     return Completion[], 1:0, false
 end
 
-function complete_path_string(path, hint::Bool=false; kws...)
+function complete_path_string(path, hint::Bool=false;
+                              shell_escape::Bool=false,
+                              cmd_escape::Bool=false,
+                              string_escape::Bool=false,
+                              kws...)
     # Expand "~" and remember if we expanded it.
     local expanded
     try
@@ -1313,12 +1339,19 @@ function complete_path_string(path, hint::Bool=false; kws...)
         expanded = false
     end
 
+    function escape(p)
+        shell_escape && (p = do_shell_escape(p))
+        string_escape && (p = do_string_escape(p))
+        cmd_escape && (p = do_cmd_escape(p))
+        p
+    end
+
     # If tab press, ispath and user expansion available, return it now
     # otherwise see if we can complete the path further before returning with expanded ~
-    expanded && !hint && ispath(path) && return Completion[PathCompletion(path)], true
+    expanded && !hint && ispath(path) && return Completion[PathCompletion(escape(path))], true
 
-    paths, dir, success = complete_path(path; contract_user=expanded, kws...)
-
+    paths, dir, success = complete_path(path; contract_user=expanded, shell_escape, cmd_escape, string_escape, kws...)
+    dir = dir == "" ? dir : escape(dir)
     expanded && (dir = contractuser(dir))
     map!(paths) do c::PathCompletion
         p = joinpath(dir, c.path)
