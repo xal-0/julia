@@ -1036,7 +1036,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     n, key, closed = find_ref_key(cur_not_ws, pos)
     if n !== nothing
         key::UnitRange{Int}
-        obj = dict_eval(Expr(n))
+        obj = dict_eval(Expr(n), context_module)
         if obj !== nothing
             # Skip leading whitespace inside brackets.
             i = @something findnext(!isspace, string, first(key)) nextind(string, last(key))
@@ -1136,7 +1136,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     end
 
     complete_modules_only = false
-    prefix = node_prefix(cur)
+    prefix = node_prefix(cur, context_module)
     comp_keywords = prefix === nothing
 
     # Complete loadable module names:
@@ -1150,7 +1150,6 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
         # Allow completion for `import Mod.name` (where `name` is not a module)
         complete_modules_only = prefix == nothing || kind(n.parent) == K"using"
         comp_keywords = false
-        # TODO: fix `using foo: bar` prefix
     end
 
     if comp_keywords
@@ -1209,7 +1208,7 @@ end
 
 # If node is the field in a getfield-like expression, return the value
 # complete_symbol! should use as the prefix.
-function node_prefix(node::CursorNode)
+function node_prefix(node::CursorNode, context_module::Module)
     node.parent !== nothing || return nothing
     p = node.parent
 
@@ -1235,10 +1234,10 @@ function node_prefix(node::CursorNode)
         end
 
         # Convert the "chain" into nested (:. a b) expressions.
-        # The cursor should be on the last node
-        good = all(x -> kind(x) == K"Identifier" && x !== node, chain)
-        all(x -> kind(x) == K"Identifier" && x !== node, chain) || return nothing
-        init, chain = chain[1].val, map(x -> Expr(:quote, x.val), chain[2:end])
+        # The cursor should be on the last node.
+        all(x -> kind(x) == K"Identifier" && x !== node || kind(x) == K".", chain) || return nothing
+        init = kind(chain[1]) == K"." ? context_module : chain[1].val
+        chain = map(x -> Expr(:quote, x.val), chain[2:end])
         return foldl((x, y) -> Expr(:., x, y), chain; init)
     end
 
