@@ -1008,7 +1008,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
 
     # Back up before whitespace to get a more useful AST node.
     pos_not_ws = findprev(!isspace, string, pos)
-    cur_not_ws = @something seek_pos(node, pos_not_ws) node
+    cur_not_ws = something(seek_pos(node, pos_not_ws), node)
 
     suggestions = Completion[]
     sort_suggestions() = sort!(unique!(named_completion, suggestions), by=named_completion_completion)
@@ -1112,25 +1112,20 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     end
 
     # Symbol completion
+    # TODO: Should completions replace the identifier at the cursor?
     if cur.parent !== nothing && kind(cur.parent) == K"var"
         # Replace the entire var"foo", but search using only "foo".
-        r = char_range(cur.parent)
+        r = intersect(char_range(cur.parent), 1:pos)
         r2 = char_range(children_nt(cur.parent)[1])
         s = string[intersect(r2, 1:pos)]
     elseif kind(cur) in KSet"Identifier @"
-        r = char_range(cur)
-        s = string[intersect(r, 1:pos)]
+        r = intersect(char_range(cur), 1:pos)
+        s = string[r]
     elseif kind(cur) == K"MacroName"
         # Include the `@`
-        r = prevind(string, cur.position):char_last(cur)
-        s = string[intersect(r, 1:pos)]
-    elseif kind(cur) in KSet"toplevel . error"
-        r = nextind(string, pos):pos
-        s = ""
+        r = intersect(prevind(string, cur.position):char_last(cur), 1:pos)
+        s = string[r]
     else
-        # Don't replace anything at the cursor if we aren't on an identifier.
-        # TODO: put back completion when empty?, fix `using foo: TAB`
-        # return Completion[], 1:0, false
         r = nextind(string, pos):pos
         s = ""
     end
@@ -1146,7 +1141,11 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     if (n = find_parent(cur, K"importpath")) !== nothing
         # Given input lines like `using Foo|`, `import Foo, Bar|` and `using Foo.Bar, Baz, |`:
         # Let's look only for packages and modules we can reach from here
-        prefix == nothing && complete_loading_candidates!(suggestions, s)
+        if prefix == nothing
+            complete_loading_candidates!(suggestions, s)
+            return sort_suggestions(), r, true
+        end
+
         # Allow completion for `import Mod.name` (where `name` is not a module)
         complete_modules_only = prefix == nothing || kind(n.parent) == K"using"
         comp_keywords = false
@@ -1211,8 +1210,10 @@ end
 function node_prefix(node::CursorNode, context_module::Module)
     node.parent !== nothing || return nothing
     p = node.parent
+    # In x.var"y", the parent is the "var" when the cursor is on "y".
+    kind(p) == K"var" && (p = p.parent)
 
-    # expr.node
+    # expr.node => expr
     if kind(p) == K"."
         n = children_nt(p)[1]
         # Don't use prefix if we are the value
@@ -1228,17 +1229,29 @@ function node_prefix(node::CursorNode, context_module::Module)
         else
             # import A.node
             # import A.node: ...
-            cs = children_nt(p)
-            length(cs) > 1 || return nothing
-            chain = cs[1:end-1]
+            chain = children_nt(p)[1:node.index_nt]
+            # Don't include the node under cursor in prefix unless it is `.`
+            kind(chain[end]) != K"." && deleteat!(chain, lastindex(chain))
+        end
+        length(chain) > 0 || return nothing
+
+        # (:importpath :x :y :z) => (:. (:. :x :y) :z)
+        # (:importpath :. :. :z) => (:. (parentmodule context_module) :z)
+        if (i = findlast(x -> kind(x) == K".", chain)) !== nothing
+            init = context_module
+            for j in 2:i
+                init = parentmodule(init)
+            end
+            deleteat!(chain, 1:i)
+        else
+            # No leading `.`, init is the first element of the path
+            init = chain[1].val
+            deleteat!(chain, 1)
         end
 
-        # Convert the "chain" into nested (:. a b) expressions.
-        # The cursor should be on the last node.
-        all(x -> kind(x) == K"Identifier" && x !== node || kind(x) == K".", chain) || return nothing
-        init = kind(chain[1]) == K"." ? context_module : chain[1].val
-        chain = map(x -> Expr(:quote, x.val), chain[2:end])
-        return foldl((x, y) -> Expr(:., x, y), chain; init)
+        # Convert the "chain" into nested (. a b) expressions.
+        all(x -> kind(x) == K"Identifier", chain) || return nothing
+        return foldl((x, y) -> Expr(:., x, Expr(:quote, y.val)), chain; init)
     end
 
     nothing

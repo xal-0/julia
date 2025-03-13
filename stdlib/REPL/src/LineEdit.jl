@@ -506,7 +506,7 @@ function complete_line(s::PromptState, repeats::Int, mod::Module; hint::Bool=fal
         edit_splice!(s, reg, completions[1].completion)
     else
         p = common_prefix(completions)
-        partial = content(s, reg.first => reg.first + sizeof(p))
+        partial = content(s, reg.first => min(bufend(s), reg.first + sizeof(p)))
         if !isempty(p) && p != partial
             # All possible completions share the same prefix, so we might as
             # well complete that.
