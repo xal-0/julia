@@ -158,6 +158,10 @@ let ex =
             export exported_symbol
             exported_symbol(::WeirdNames) = nothing
 
+            macro ignoremacro(e...)
+                :nothing
+            end
+
         end # module CompletionFoo
         test_repl_comp_dict = CompletionFoo.test_dict
         test_repl_comp_customdict = CompletionFoo.test_customdict
@@ -2509,4 +2513,24 @@ let s = "using .CompletionFoo: bar, type_"
     @test "type_test" in c
     @test r == 28:32
     @test s[r] == "type_"
+end
+
+# #55518
+let s = "CompletionFoo.@barfoo kwtest"
+    c, r = test_complete(s)
+    @test isempty(c)
+end
+
+# #57611
+let s = "x = Base.BinaryPlatforms.ar"
+    c, r = test_complete(s)
+    @test "arch" in c
+    @test r == 26:27
+end
+
+# #55520
+let s = "@ignoremacro A .= A setup=(A=ident"
+    c, r = test_complete(s)
+    @test "identity"in c
+    @test r == 30:34
 end
