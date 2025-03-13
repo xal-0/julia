@@ -714,7 +714,6 @@ end
 
 function complete_methods(ex_org::Expr, context_module::Module=Main, shift::Bool=false)
     kwargs_flag, funct, args_ex, kwargs_ex = _complete_methods(ex_org, context_module, shift)::Tuple{Int, Any, Vector{Any}, Set{Symbol}}
-    # println("ex=$ex_org kwargs_flag=$kwargs_flag, funct=$funct, args_ex=$args_ex, kwargs_ex=$kwargs_ex")
     out = Completion[]
     kwargs_flag == 2 && return out # one of the kwargs is invalid
     kwargs_flag == 0 && push!(args_ex, Vararg{Any}) # allow more arguments if there is no semicolon
@@ -1013,15 +1012,6 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     suggestions = Completion[]
     sort_suggestions() = sort!(unique!(named_completion, suggestions), by=named_completion_completion)
 
-    # TODO: remove
-    # hint && return Completion[], 1:0, false
-    # if !hint
-    #     partial = @view string[1:pos]
-    #     println("\ncompletions for pos=$pos: $(partial)|$(string[nextind(string, pos):end])")
-    #     println("  pos at $(kind(cur))")
-    #     show(stdout, MIME("text/plain"), node)
-    # end
-
     # Search for methods (requires tab press):
     #   ?(x, y)TAB           lists methods you can call with these objects
     #   ?(x, y TAB           lists methods that take these objects as the first two arguments
@@ -1089,13 +1079,17 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
         func = first(children_nt(n))
         e = Expr(n)
         # Remove arguments past the first parse error (allows unclosed parens)
-        i = findfirst(x -> x isa Expr && x.head == :error, e.args)
-        i !== nothing && (e.args = e.args[1:i-1])
+        if is_broadcasting_expr(e)
+            i = findfirst(x -> x isa Expr && x.head == :error, e.args[2].args)
+            i !== nothing && deleteat!(e.args[2].args, i:lastindex(e.args[2].args))
+        else
+            i = findfirst(x -> x isa Expr && x.head == :error, e.args)
+            i !== nothing && deleteat!(e.args, i:lastindex(e.args))
+        end
 
         # Method completion:
         #   foo( TAB     => list of method signatures for foo
         #   foo(x, TAB   => list of methods signatures for foo with x as first argument
-        # TODO: allow method completion using arguments past the cursor?
         if kind(cur_not_ws) in KSet"( , ;"
             # Don't provide method completions unless the cursor is after: '(' ',' ';'
             return complete_methods(e, context_module, shift), char_range(func), false
@@ -1155,8 +1149,6 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
         complete_keyword!(suggestions, s)
         complete_keyval!(suggestions, s)
     end
-
-    # !hint && println("\nkeywords? $comp_keywords, modules only? $complete_modules_only, pref=$prefix")
 
     complete_symbol!(suggestions, prefix, s, context_module; complete_modules_only, shift)
     return sort_suggestions(), r, true
@@ -1358,13 +1350,17 @@ function complete_path_string(path, hint::Bool=false;
         p
     end
 
-    # If tab press, ispath and user expansion available, return it now
-    # otherwise see if we can complete the path further before returning with expanded ~
-    expanded && !hint && ispath(path) && return Completion[PathCompletion(escape(path))], true
-
     paths, dir, success = complete_path(path; contract_user=expanded, shell_escape, cmd_escape, string_escape, kws...)
     dir = dir == "" ? dir : escape(dir)
-    expanded && (dir = contractuser(dir))
+
+    # Expand '~' if the user hits TAB after exhausting completions (either
+    # because we have found an existing file, or there is no such file).
+    full_path = ispath(path) || isempty(paths)
+    expanded && !hint && full_path && return Completion[PathCompletion(escape(path))], true
+
+    # Expand '~' if the user hits TAB on a path ending in '/'.
+    expanded && (hint || path != dir * "/") && (dir = contractuser(dir))
+
     map!(paths) do c::PathCompletion
         p = joinpath(dir, c.path)
         PathCompletion(p)
