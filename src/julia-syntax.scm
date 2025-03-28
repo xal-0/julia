@@ -2518,8 +2518,50 @@
                 (= ,lhs ,(car rr))))
       `(= ,lhs ,rhs)))
 
+(define (expand-import what body)
+  (define (expand-path path mod (final #f))
+    (let loop ((mod mod)
+               (path path))
+      ;; (display (string "  expand-path " mod " " path " " final "\n"))
+      (cond ((null? path) mod)
+            ((and (not mod) (eq? (car path) '|.|))
+             (loop '(thismodule) (cdr path)))
+            ((and (not mod) (memq (car path) '(Core Base)))
+             (loop (car path) (cdr path)))
+            ((and (not mod) (symbol? (car path)))
+             (display (string "requiring: " (car path) " context: " body "\n"))
+             (loop `(call (top require) (thismodule) ',(car path)) (cdr path)))
+            ((eq? (car path) '|.|)
+             (loop `(call (top parentmodule) ,mod) (cdr path)))
+            ((and final (null? (cdr path)))
+             (final mod (car path)))
+            ((symbol? (car path))
+             (loop `(call (top getproperty) ,mod ',(car path)) (cdr path)))
+            (else (error "what")))))
+  (define (do-import mod sym)
+    `(call (core module_import) (thismodule)
+           ,mod ',sym ',sym ,(if (eq? what 'import) '(true) '(false))))
+  (define (do-using mod)
+    `(call (core module_using) (thismodule) ,mod))
+
+  ;; (display (string "body? " body "\n"))
+  (cond ((eq? (caar body) ':)
+         (let* ((r (make-ssavalue))
+                (mod-path (cdadar body))
+                (es (map (lambda (p) (expand-path (cdr p) r do-import))
+                         (cddar body))))
+           `(block (= ,r ,(expand-path mod-path #f))
+                   ,.es
+                   (latestworld))))
+        ((eq? what 'using)
+         `(block ,(do-using (expand-path (cdar body) #f))
+                 (latestworld)))
+        (else
+         `(block ,(expand-path (cdar body) #f do-import)
+                 (latestworld)))))
+
 (define (expand-forms e)
-  (if (or (atom? e) (memq (car e) '(quote inert top core globalref module toplevel ssavalue null true false meta using import export public thismodule toplevel-only)))
+  (if (or (atom? e) (memq (car e) '(quote inert top core globalref module toplevel ssavalue null true false meta export public thismodule toplevel-only)))
       e
       (let ((ex (get expand-table (car e) #f)))
         (if ex
@@ -2937,7 +2979,9 @@
     (lambda (e)
       (set! *current-desugar-loc* e)
       e)
-    ))
+
+    'import (lambda (e) (expand-import (car e) (cdr e)))
+    'using (lambda (e) (expand-import (car e) (cdr e)))))
 
 (define (has-return? e)
   (expr-contains-p return? e (lambda (x) (not (function-def? x)))))
@@ -3181,7 +3225,7 @@
          (check-valid-name (cadr e))
          ;; remove local decls
          '(null))
-        ((memq (car e) '(using import export public))
+        ((memq (car e) '(export public))
           ;; no scope resolution - identifiers remain raw symbols
           e)
         ((eq? (car e) 'require-existing-local)
@@ -3811,7 +3855,7 @@ f(x) = yt(x)
          thunk with-static-parameters toplevel-only
          global globalref global-if-global assign-const-if-global isglobal thismodule
          const atomic null true false ssavalue isdefined toplevel module lambda
-         error gc_preserve_begin gc_preserve_end import using export public inline noinline purity)))
+         error gc_preserve_begin gc_preserve_end export public inline noinline purity)))
 
 (define (local-in? s lam (tab #f))
   (or (and tab (has? tab s))
@@ -4043,7 +4087,7 @@ f(x) = yt(x)
        ((atom? e) e)
        (else
         (case (car e)
-          ((quote top core globalref thismodule lineinfo line break inert module toplevel null true false meta import using) e)
+          ((quote top core globalref thismodule lineinfo line break inert module toplevel null true false meta) e)
           ((toplevel-only)
            ;; hack to avoid generating a (method x) expr for struct types
            (if (eq? (cadr e) 'struct)
@@ -5035,7 +5079,7 @@ f(x) = yt(x)
              '(null))
 
             ;; other top level expressions
-            ((import using export public latestworld)
+            ((export public latestworld)
              (check-top-level e)
              (if (not (eq? (car e) 'latestworld))
               (emit e))
@@ -5278,7 +5322,7 @@ f(x) = yt(x)
             ((nospecialize-meta? e)
              ;; convert nospecialize vars to slot numbers
              `(meta ,(cadr e) ,@(map renumber-stuff (cddr e))))
-            ((or (atom? e) (quoted? e) (memq (car e) '(using import export public global toplevel)))
+            ((or (atom? e) (quoted? e) (memq (car e) '(using export public global toplevel)))
              e)
             ((ssavalue? e)
              (let ((idx (get ssavalue-table (cadr e) #f)))

@@ -74,6 +74,8 @@ DECLARE_BUILTIN(throw_methoderror);
 DECLARE_BUILTIN(tuple);
 DECLARE_BUILTIN(typeassert);
 DECLARE_BUILTIN(typeof);
+DECLARE_BUILTIN(module_import);
+DECLARE_BUILTIN(module_using);
 
 JL_CALLABLE(jl_f__structtype);
 JL_CALLABLE(jl_f__abstracttype);

@@ -1482,7 +1482,50 @@ JL_CALLABLE(jl_f_setglobalonce)
     return old == NULL ? jl_true : jl_false;
 }
 
+// module import/using --------------------------------------------------------
 
+JL_CALLABLE(jl_f_module_import)
+{
+    JL_NARGSV(module_import, 5);
+    JL_TYPECHK(module_import, module, args[0]);
+    JL_TYPECHK(module_import, module, args[1]);
+    JL_TYPECHK(module_import, symbol, args[2]);
+    JL_TYPECHK(module_import, symbol, args[3]);
+    JL_TYPECHK(module_import, bool, args[4]);
+
+    jl_printf(JL_STDERR, "module_import: ");
+    jl_static_show((JL_STREAM*)STDERR_FILENO, args[0]);
+    jl_printf(JL_STDERR, "  ");
+    jl_static_show((JL_STREAM*)STDERR_FILENO, args[1]);
+    jl_printf(JL_STDERR, "  ");
+    jl_static_show((JL_STREAM*)STDERR_FILENO, args[2]);
+    jl_printf(JL_STDERR, "  ");
+    jl_static_show((JL_STREAM*)STDERR_FILENO, args[3]);
+    jl_printf(JL_STDERR, "  ");
+    jl_static_show((JL_STREAM*)STDERR_FILENO, args[4]);
+    jl_printf(JL_STDERR, "\n");
+    jl_uv_flush(JL_STDERR);
+
+    jl_module_import(jl_current_task, args[0], args[1], args[2], args[3], args[4] == jl_true);
+
+    return jl_nothing;
+}
+
+JL_CALLABLE(jl_f_module_using)
+{
+    JL_NARGSV(module_using, 2);
+    JL_TYPECHK(module_import, module, args[0]);
+    JL_TYPECHK(module_import, module, args[1]);
+
+    jl_printf(JL_STDERR, "module_using: ");
+    jl_static_show((JL_STREAM*)STDERR_FILENO, args[0]);
+    jl_printf(JL_STDERR, "  ");
+    jl_static_show((JL_STREAM*)STDERR_FILENO, args[1]);
+    jl_printf(JL_STDERR, "\n");
+
+    jl_module_using(args[0], args[1]);
+    return jl_nothing;
+}
 
 // apply_type -----------------------------------------------------------------
 
@@ -2527,6 +2570,9 @@ void jl_init_primitives(void) JL_GC_DISABLED
     add_builtin_func("_svec_ref", jl_f__svec_ref);
     jl_builtin_current_scope = add_builtin_func("current_scope", jl_f_current_scope);
     add_builtin_func("throw_methoderror", jl_f_throw_methoderror);
+
+    jl_builtin_module_import = add_builtin_func("module_import", jl_f_module_import);
+    jl_builtin_module_using = add_builtin_func("module_using", jl_f_module_using);
 
     // builtin types
     add_builtin("Any", (jl_value_t*)jl_any_type);
