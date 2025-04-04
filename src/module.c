@@ -5,6 +5,7 @@
   modules and top-level bindings
 */
 #include "julia.h"
+#include "julia_atomics.h"
 #include "julia_internal.h"
 #include "julia_assert.h"
 
@@ -539,6 +540,9 @@ JL_DLLEXPORT jl_binding_partition_t *jl_declare_constant_val3(
     if (!b) {
         b = jl_get_module_binding(mod, var, 1);
     }
+    if (jl_atomic_load_relaxed(&b->flags) & BINDING_FLAG_FROZEN)
+        jl_errorf("cannot declare %s.%s constant; it is frozen",
+                  jl_symbol_name(mod->name), jl_symbol_name(var));
     jl_binding_partition_t *new_bpart = NULL;
     jl_binding_partition_t *bpart = jl_get_binding_partition(b, new_world);
     while (!new_bpart) {
@@ -1411,6 +1415,9 @@ int jl_module_public_(jl_module_t *from, jl_sym_t *s, int exported, size_t new_w
     jl_binding_t *b = jl_get_module_binding(from, s, 1);
     jl_binding_partition_t *bpart = jl_get_binding_partition(b, new_world);
     int was_exported = (bpart->kind & PARTITION_FLAG_EXPORTED) != 0;
+    if (jl_atomic_load_relaxed(&b->flags) & BINDING_FLAG_FROZEN)
+        jl_errorf("cannot declare %s.%s public; it is frozen",
+                  jl_symbol_name(from->name), jl_symbol_name(s));
     if (jl_atomic_load_relaxed(&b->flags) & BINDING_FLAG_PUBLICP) {
         // check for conflicting declarations
         if (was_exported && !exported)
@@ -1727,6 +1734,10 @@ JL_DLLEXPORT void jl_disable_binding(jl_globalref_t *gr)
     jl_binding_t *b = gr->binding;
     if (!b)
         b = jl_get_module_binding(gr->mod, gr->name, 1);
+    if (jl_atomic_load_relaxed(&b->flags) & BINDING_FLAG_FROZEN)
+        jl_errorf("cannot disable %s.%s; it is frozen",
+                  jl_symbol_name(gr->mod->name), jl_symbol_name(gr->name));
+    jl_binding_partition_t *bpart = jl_get_binding_partition(b, jl_current_task->world_age);
 
     for (;;) {
         jl_binding_partition_t *bpart = jl_get_binding_partition(b, jl_atomic_load_acquire(&jl_world_counter));

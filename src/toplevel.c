@@ -292,6 +292,9 @@ void jl_declare_global(jl_module_t *m, jl_value_t *arg, jl_value_t *set_type, in
     size_t new_world = jl_atomic_load_relaxed(&jl_world_counter) + 1;
     jl_binding_t *b = jl_get_module_binding(gm, gs, 1);
     jl_binding_partition_t *bpart = NULL;
+    if (jl_atomic_load_relaxed(&b->flags) & BINDING_FLAG_FROZEN)
+        jl_errorf("cannot declare %s.%s global; it is frozen",
+                  jl_symbol_name(gm->name), jl_symbol_name(gs));
     if (!strong && set_type)
         jl_error("Weak global definitions cannot have types");
     enum jl_partition_kind new_kind = strong ? PARTITION_KIND_GLOBAL : PARTITION_KIND_DECLARED;

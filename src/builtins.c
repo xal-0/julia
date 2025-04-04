@@ -3,6 +3,7 @@
 /*
   implementations of built-in functions
 */
+#include "julia_atomics.h"
 #include "platform.h"
 
 #include <stdlib.h>
@@ -918,7 +919,7 @@ static jl_value_t *arg_tuple(jl_value_t *a1, jl_value_t **args, size_t nargs)
 JL_CALLABLE(jl_f_tuple)
 {
     if (nargs == 0)
-        return (jl_value_t*)jl_emptytuple;
+        return (jl_value_t *)jl_emptytuple;
     return arg_tuple(args[0], &args[1], nargs);
 }
 
@@ -1482,7 +1483,28 @@ JL_CALLABLE(jl_f_setglobalonce)
     return old == NULL ? jl_true : jl_false;
 }
 
+JL_CALLABLE(jl_f_freezebinding)
+{
+    JL_NARGS(freezebinding!, 2, 3);
+    JL_TYPECHK(freezebinding!, module, args[0]);
+    JL_TYPECHK(freezebinding!, symbol, args[1]);
 
+    jl_module_t *mod = (jl_module_t *)args[0];
+    jl_sym_t *name = (jl_sym_t *)args[1];
+    int freeze = 1;
+    if (nargs == 3) {
+        JL_TYPECHK(freebinding!, bool, args[2]);
+        freeze = args[2] == jl_true;
+    }
+
+    jl_binding_t *b = jl_get_module_binding(mod, name, 1);
+    if (freeze)
+        jl_atomic_fetch_or_relaxed(&b->flags, BINDING_FLAG_FROZEN);
+    else
+        jl_atomic_fetch_and_relaxed(&b->flags, ~BINDING_FLAG_FROZEN);
+
+    return jl_nothing;
+}
 
 // apply_type -----------------------------------------------------------------
 
@@ -2485,6 +2507,7 @@ void jl_init_primitives(void) JL_GC_DISABLED
     jl_builtin_replaceglobal = add_builtin_func("replaceglobal!", jl_f_replaceglobal);
     jl_builtin_modifyglobal = add_builtin_func("modifyglobal!", jl_f_modifyglobal);
     jl_builtin_setglobalonce = add_builtin_func("setglobalonce!", jl_f_setglobalonce);
+    add_builtin_func("freezebinding!", jl_f_freezebinding);
 
     // memory primitives
     jl_builtin_memorynew = add_builtin_func("memorynew", jl_f_memorynew);

@@ -65,6 +65,7 @@ DECLARE_BUILTIN(setfield);
 DECLARE_BUILTIN(setfieldonce);
 DECLARE_BUILTIN(setglobal);
 DECLARE_BUILTIN(setglobalonce);
+DECLARE_BUILTIN(freezebinding);
 DECLARE_BUILTIN(sizeof);
 DECLARE_BUILTIN(svec);
 DECLARE_BUILTIN(swapfield);
