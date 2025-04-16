@@ -61,6 +61,7 @@ DECLARE_BUILTIN(modifyglobal);
 DECLARE_BUILTIN(nfields);
 DECLARE_BUILTIN(replacefield);
 DECLARE_BUILTIN(replaceglobal);
+DECLARE_BUILTIN(setconst);
 DECLARE_BUILTIN(setfield);
 DECLARE_BUILTIN(setfieldonce);
 DECLARE_BUILTIN(setglobal);

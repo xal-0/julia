@@ -386,7 +386,7 @@ static void expr_attributes(jl_value_t *v, jl_array_t *body, int *has_ccall, int
         // might still need to be optimized.
         return;
     }
-    else if (head == jl_const_sym || head == jl_copyast_sym) {
+    else if (head == jl_copyast_sym) {
         // Note: `copyast` is included here since it indicates the presence of
         // `quote` and probably `eval`.
         *has_defs = 1;
@@ -605,7 +605,7 @@ int jl_needs_lowering(jl_value_t *e) JL_NOTSAFEPOINT
         head == jl_method_sym) {
         return 0;
     }
-    if (head == jl_global_sym || head == jl_const_sym) {
+    if (head == jl_global_sym) {
         size_t i, l = jl_array_nrows(ex->args);
         for (i = 0; i < l; i++) {
             jl_value_t *a = jl_exprarg(ex, i);
@@ -739,23 +739,6 @@ JL_DLLEXPORT jl_binding_partition_t *jl_declare_constant_val2(
 JL_DLLEXPORT jl_binding_partition_t *jl_declare_constant_val(jl_binding_t *b, jl_module_t *mod, jl_sym_t *var, jl_value_t *val)
 {
     return jl_declare_constant_val2(b, mod, var, val, val ? PARTITION_KIND_CONST : PARTITION_KIND_UNDEF_CONST);
-}
-
-JL_DLLEXPORT void jl_eval_const_decl(jl_module_t *m, jl_value_t *arg, jl_value_t *val)
-{
-    jl_module_t *gm;
-    jl_sym_t *gs;
-    if (jl_is_globalref(arg)) {
-        gm = jl_globalref_mod(arg);
-        gs = jl_globalref_name(arg);
-    }
-    else {
-        assert(jl_is_symbol(arg));
-        gm = m;
-        gs = (jl_sym_t*)arg;
-    }
-    jl_binding_t *b = jl_get_module_binding(gm, gs, 1);
-    jl_declare_constant_val(b, gm, gs, val);
 }
 
 JL_DLLEXPORT jl_value_t *jl_toplevel_eval_flex(jl_module_t *JL_NONNULL m, jl_value_t *e, int fast, int expanded, const char **toplevel_filename, int *toplevel_lineno)
@@ -961,7 +944,21 @@ JL_DLLEXPORT jl_value_t *jl_toplevel_eval_flex(jl_module_t *JL_NONNULL m, jl_val
         return jl_nothing;
     }
     else if (head == jl_const_sym) {
-        jl_eval_const_decl(m, jl_exprarg(ex, 0), NULL);
+        // TODO: remove or provide a better way to make undefined constants.
+        jl_value_t *arg = jl_exprarg(ex, 0);
+        jl_module_t *gm;
+        jl_sym_t *gs;
+        if (jl_is_globalref(arg)) {
+            gm = jl_globalref_mod(arg);
+            gs = jl_globalref_name(arg);
+        }
+        else {
+            assert(jl_is_symbol(arg));
+            gm = m;
+            gs = (jl_sym_t*)arg;
+        }
+        jl_binding_t *b = jl_get_module_binding(gm, gs, 1);
+        jl_declare_constant_val(b, gm, gs, NULL);
         JL_GC_POP();
         return jl_nothing;
     }

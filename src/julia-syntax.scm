@@ -4642,10 +4642,15 @@ f(x) = yt(x)
                                  (list cnd))))))
           tests))
     (define (emit-assignment-or-setglobal lhs rhs (op '=))
-      ;; (const (globalref _ _) _) does not use setglobal!
-      (if (and (globalref? lhs) (eq? op '=))
-        (emit `(call (top setglobal!) ,(cadr lhs) (inert ,(caddr lhs)) ,rhs))
-        (emit `(,op ,lhs ,rhs))))
+      ;; (= (globalref _ _) _)     => setglobal!
+      ;; (const (globalref _ _) _) => setconst!
+      (cond ((and (globalref? lhs) (eq? op '=))
+             (emit `(call (top setglobal!) ,(cadr lhs) (inert ,(caddr lhs)) ,rhs)))
+            ((and (globalref? lhs) (eq? op 'const))
+             (emit `(call (top setconst!) ,(cadr lhs) (inert ,(caddr lhs)) ,rhs)))
+            (else
+             (assert (eq? op '=))
+             (emit `(= ,lhs ,rhs)))))
     (define (emit-assignment lhs rhs (op '=))
       (if rhs
           (if (valid-ir-rvalue? lhs rhs)

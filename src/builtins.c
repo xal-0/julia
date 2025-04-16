@@ -1483,7 +1483,15 @@ JL_CALLABLE(jl_f_setglobalonce)
     return old == NULL ? jl_true : jl_false;
 }
 
-
+JL_CALLABLE(jl_f_setconst)
+{
+    JL_NARGS(setconst!, 3, 3);
+    JL_TYPECHK(setconst!, module, args[0]);
+    JL_TYPECHK(setconst!, symbol, args[1]);
+    jl_binding_t *b = jl_get_module_binding((jl_module_t *)args[0], (jl_sym_t *)args[1], 1);
+    jl_declare_constant_val(b, (jl_module_t *)args[0], (jl_sym_t *)args[1], args[2]);
+    return args[2];
+}
 
 // apply_type -----------------------------------------------------------------
 
@@ -2486,6 +2494,7 @@ void jl_init_primitives(void) JL_GC_DISABLED
     jl_builtin_replaceglobal = add_builtin_func("replaceglobal!", jl_f_replaceglobal);
     jl_builtin_modifyglobal = add_builtin_func("modifyglobal!", jl_f_modifyglobal);
     jl_builtin_setglobalonce = add_builtin_func("setglobalonce!", jl_f_setglobalonce);
+    add_builtin_func("setconst!", jl_f_setconst);
 
     // memory primitives
     jl_builtin_memorynew = add_builtin_func("memorynew", jl_f_memorynew);
