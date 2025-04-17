@@ -1485,11 +1485,13 @@ JL_CALLABLE(jl_f_setglobalonce)
 
 JL_CALLABLE(jl_f_setconst)
 {
-    JL_NARGS(setconst!, 3, 3);
+    JL_NARGS(setconst!, 2, 3);
     JL_TYPECHK(setconst!, module, args[0]);
-    JL_TYPECHK(setconst!, symbol, args[1]);
+    if (nargs == 3)
+        JL_TYPECHK(setconst!, symbol, args[1]);
     jl_binding_t *b = jl_get_module_binding((jl_module_t *)args[0], (jl_sym_t *)args[1], 1);
-    jl_declare_constant_val(b, (jl_module_t *)args[0], (jl_sym_t *)args[1], args[2]);
+    jl_value_t *val = nargs == 3 ? args[2] : NULL;
+    jl_declare_constant_val(b, (jl_module_t *)args[0], (jl_sym_t *)args[1], val);
     return args[2];
 }
 

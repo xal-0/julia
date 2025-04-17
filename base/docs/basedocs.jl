@@ -2754,10 +2754,13 @@ See also [`setpropertyonce!`](@ref Base.setpropertyonce!) and [`setglobal!`](@re
 setglobalonce!
 
 """
-    setconst!(module::Module, name::Symbol, x)
+    setconst!(module::Module, name::Symbol, [x])
 
 Create or replace the constant `name` in `module` with the new value `x`.  When
 replacing, `x` does not need to have the same type as the original constant.
+
+When `x` is not given, `name` becomes an undefined constant; it cannot be read
+or written to, but can be redefined.
 
 Note that this function does not update the world age of the current task:
 ```

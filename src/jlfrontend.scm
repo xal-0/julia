@@ -136,13 +136,11 @@
               (cadadr (lam:body th))
               `(thunk ,th))))))
 
-;; TODO: don't allow one argument const (like Expr(:const, :a)) through lowering
-;; when we provide an alternative to get PARTITION_KIND_UNDEF_CONST bindings.
 (define (toplevel-only-expr? e)
   (and (pair? e)
        (or (memq (car e) '(toplevel line module export public
                                     error incomplete))
-           (and (memq (car e) '(global const)) (every symbol? (cdr e))))))
+           (and (memq (car e) '(global)) (every symbol? (cdr e))))))
 
 (define *in-expand* #f)
 

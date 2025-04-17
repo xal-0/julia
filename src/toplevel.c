@@ -587,7 +587,6 @@ int jl_is_toplevel_only_expr(jl_value_t *e) JL_NOTSAFEPOINT
          ((jl_expr_t*)e)->head == jl_thunk_sym ||
          ((jl_expr_t*)e)->head == jl_global_sym ||
          ((jl_expr_t*)e)->head == jl_globaldecl_sym ||
-         ((jl_expr_t*)e)->head == jl_const_sym ||
          ((jl_expr_t*)e)->head == jl_toplevel_sym ||
          ((jl_expr_t*)e)->head == jl_error_sym ||
          ((jl_expr_t*)e)->head == jl_incomplete_sym);
@@ -940,25 +939,6 @@ JL_DLLEXPORT jl_value_t *jl_toplevel_eval_flex(jl_module_t *JL_NONNULL m, jl_val
             jl_value_t *arg = jl_exprarg(ex, i);
             jl_declare_global(m, arg, NULL, 0);
         }
-        JL_GC_POP();
-        return jl_nothing;
-    }
-    else if (head == jl_const_sym) {
-        // TODO: remove or provide a better way to make undefined constants.
-        jl_value_t *arg = jl_exprarg(ex, 0);
-        jl_module_t *gm;
-        jl_sym_t *gs;
-        if (jl_is_globalref(arg)) {
-            gm = jl_globalref_mod(arg);
-            gs = jl_globalref_name(arg);
-        }
-        else {
-            assert(jl_is_symbol(arg));
-            gm = m;
-            gs = (jl_sym_t*)arg;
-        }
-        jl_binding_t *b = jl_get_module_binding(gm, gs, 1);
-        jl_declare_constant_val(b, gm, gs, NULL);
         JL_GC_POP();
         return jl_nothing;
     }
