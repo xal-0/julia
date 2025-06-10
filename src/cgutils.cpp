@@ -38,6 +38,8 @@ STATISTIC(EmittedWriteBarriers, "Number of write barriers emitted");
 STATISTIC(EmittedNewStructs, "Number of new structs emitted");
 STATISTIC(EmittedDeferSignal, "Number of deferred signals emitted");
 
+static name_counter global_name_counter;
+
 static Value *track_pjlvalue(jl_codectx_t &ctx, Value *V)
 {
     assert(V->getType() == ctx.types().T_pjlvalue);
@@ -401,8 +403,7 @@ static Constant *julia_pgv(jl_codegen_params_t &params, Module *M, const char *c
     StringRef localname;
     std::string gvname;
     if (!gv) {
-        uint64_t id = jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1); // TODO: use params.global_targets.size()
-        raw_string_ostream(gvname) << cname << id;
+        gvname = global_name_counter(cname);
         localname = StringRef(gvname);
     }
     else {
@@ -419,7 +420,6 @@ static Constant *julia_pgv(jl_codegen_params_t &params, Module *M, const char *c
     // Mark the global as constant to LLVM code using our own metadata
     // which is much less likely to be striped.
     gv->setMetadata("julia.constgv", MDNode::get(gv->getContext(), None));
-    assert(localname == gv->getName());
     assert(!gv->hasInitializer());
     return gv;
 }
