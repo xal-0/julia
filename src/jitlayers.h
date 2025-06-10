@@ -268,6 +268,9 @@ struct jl_codegen_params_t {
     DenseMap<AttributeList, std::map<
         std::tuple<GlobalVariable*, FunctionType*, CallingConv::ID>,
         GlobalVariable*>> allPltMap;
+    // When local_unique_names is enabled, maps from local name -> global name
+    StringMap<StringRef> local_names;
+    int name_counter = 0;
     std::unique_ptr<Module> _shared_module;
     inline Module &shared_module();
     // inputs
@@ -277,6 +280,7 @@ struct jl_codegen_params_t {
     bool imaging_mode;
     bool safepoint_on_entry = true;
     bool use_swiftcc = true;
+    bool local_unique_names = false;
     jl_codegen_params_t(orc::ThreadSafeContext ctx, DataLayout DL, Triple triple) JL_NOTSAFEPOINT  JL_NOTSAFEPOINT_ENTER
       : tsctx(std::move(ctx)),
         tsctx_lock(tsctx.getLock()),

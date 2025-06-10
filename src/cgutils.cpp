@@ -38,6 +38,24 @@ STATISTIC(EmittedWriteBarriers, "Number of write barriers emitted");
 STATISTIC(EmittedNewStructs, "Number of new structs emitted");
 STATISTIC(EmittedDeferSignal, "Number of deferred signals emitted");
 
+static _Atomic(uint64_t) globalUniqueGeneratedNames{1};
+
+template<class... Ts>
+static std::string generate_name(jl_codegen_params_t &params, Ts... args)
+{
+    std::string global_name;
+    raw_string_ostream s{global_name};
+    (s << ... << args);
+    std::string local_name{global_name};
+    s << "_" << jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1);
+    if (params.local_unique_names) {
+        raw_string_ostream(local_name) << "_" << ++params.name_counter;
+        params.local_names[local_name] = global_name;
+        return local_name;
+    }
+    return global_name;
+}
+
 static Value *track_pjlvalue(jl_codectx_t &ctx, Value *V)
 {
     assert(V->getType() == ctx.types().T_pjlvalue);
@@ -401,8 +419,7 @@ static Constant *julia_pgv(jl_codegen_params_t &params, Module *M, const char *c
     StringRef localname;
     std::string gvname;
     if (!gv) {
-        uint64_t id = jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1); // TODO: use params.global_targets.size()
-        raw_string_ostream(gvname) << cname << id;
+        gvname = generate_name(params, cname);
         localname = StringRef(gvname);
     }
     else {
