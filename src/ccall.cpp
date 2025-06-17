@@ -82,7 +82,7 @@ static bool runtime_sym_gvs(jl_codectx_t &ctx, const char *f_lib, const char *f_
         symMap = &ctx.emission_context.symMapDefault;
     }
     else {
-        std::string name = generate_name(ctx.emission_context, "ccalllib_", llvm::sys::path::filename(f_lib));
+        std::string name = global_name_counter("ccalllib_", llvm::sys::path::filename(f_lib));
         runtime_lib = true;
         auto &libgv = ctx.emission_context.libMapGV[f_lib];
         if (libgv.first == NULL) {
@@ -99,7 +99,7 @@ static bool runtime_sym_gvs(jl_codectx_t &ctx, const char *f_lib, const char *f_
 
     GlobalVariable *&llvmgv = (*symMap)[f_name];
     if (llvmgv == NULL) {
-        std::string name = generate_name(ctx.emission_context, "ccall_", f_name);
+        std::string name = global_name_counter("ccall_", f_name);
         auto T_pvoidfunc = getPointerTy(M->getContext());
         llvmgv = new GlobalVariable(*M, T_pvoidfunc, false,
                                     GlobalVariable::ExternalLinkage,
@@ -201,7 +201,7 @@ static Value *runtime_sym_lookup(
         // pointer just for this call site.
         runtime_lib = true;
         libptrgv = NULL;
-        std::string gvname = generate_name(ctx.emission_context, "libname_", f_name);
+        std::string gvname = global_name_counter("libname_", f_name);
         llvmgv = new GlobalVariable(*jl_Module, T_pvoidfunc, false,
                                     GlobalVariable::ExternalLinkage,
                                     Constant::getNullValue(T_pvoidfunc), gvname);
@@ -228,7 +228,7 @@ static GlobalVariable *emit_plt_thunk(
     PointerType *funcptype = PointerType::get(functype, 0);
     libptrgv = prepare_global_in(M, libptrgv);
     llvmgv = prepare_global_in(M, llvmgv);
-    std::string fname = generate_name(ctx.emission_context, "jlplt_", f_name);
+    std::string fname = global_name_counter("jlplt_", f_name);
     Function *plt = Function::Create(functype,
                                      GlobalVariable::PrivateLinkage,
                                      fname, M);
@@ -824,7 +824,7 @@ static jl_cgval_t emit_llvmcall(jl_codectx_t &ctx, jl_value_t **args, size_t nar
     bool retboxed;
     Type *rettype = julia_type_to_llvm(ctx, rtt, &retboxed);
 
-    std::string ir_name = generate_name(ctx.emission_context, "llvmcall");
+    std::string ir_name = global_name_counter("llvmcall");
 
     // generate a temporary module that contains our IR
     std::unique_ptr<Module> Mod;

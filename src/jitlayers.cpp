@@ -261,32 +261,33 @@ void *jl_jit_abi_converter_impl(jl_task_t *ct, void *unspecialized, jl_value_t *
 {
     if (codeinst == nullptr && unspecialized != nullptr)
         return unspecialized;
-    orc::ThreadSafeModule result_m;
+    jl_codegen_output_t output;
+    orc::ThreadSafeContext ctx{std::make_unique<LLVMContext>()};
     std::string gf_thunk_name;
     {
-        jl_codegen_params_t params(std::make_unique<LLVMContext>(), jl_ExecutionEngine->getDataLayout(), jl_ExecutionEngine->getTargetTriple()); // Locks the context
+        jl_codegen_params_t params(ctx, jl_ExecutionEngine->getDataLayout(), jl_ExecutionEngine->getTargetTriple()); // Locks the context
         params.getContext().setDiscardValueNames(true);
         params.cache = true;
         params.imaging_mode = 0;
-        result_m = jl_create_ts_module("gfthunk", params.tsctx, params.DL, params.TargetTriple);
-        Module *M = result_m.getModuleUnlocked();
+        output = jl_create_codegen_output("gfthunk", params.tsctx, params.DL, params.TargetTriple);
+        Module *M = output.module();
         if (target) {
             Value *llvmtarget = literal_static_pointer_val((void*)target, PointerType::get(M->getContext(), 0));
-            gf_thunk_name = emit_abi_converter(M, params, declrt, sigt, nargs, specsig, codeinst, llvmtarget, target_specsig);
+            gf_thunk_name = emit_abi_converter(output, params, declrt, sigt, nargs, specsig, codeinst, llvmtarget, target_specsig);
         }
         else if (invoke == jl_fptr_const_return_addr) {
-            gf_thunk_name = emit_abi_constreturn(M, params, declrt, sigt, nargs, specsig, codeinst->rettype_const);
+            gf_thunk_name = emit_abi_constreturn(output, params, declrt, sigt, nargs, specsig, codeinst->rettype_const);
         }
         else {
             Value *llvminvoke = invoke ? literal_static_pointer_val((void*)invoke, PointerType::get(M->getContext(), 0)) : nullptr;
-            gf_thunk_name = emit_abi_dispatcher(M, params, declrt, sigt, nargs, specsig, codeinst, llvminvoke);
+            gf_thunk_name = emit_abi_dispatcher(output, params, declrt, sigt, nargs, specsig, codeinst, llvminvoke);
         }
         SmallVector<orc::ThreadSafeModule,0> sharedmodules;
         finish_params(M, params, sharedmodules);
         assert(sharedmodules.empty());
     }
     int8_t gc_state = jl_gc_safe_enter(ct->ptls);
-    jl_ExecutionEngine->addModule(std::move(result_m));
+    jl_ExecutionEngine->addModule(std::move(output.mod));
     uintptr_t Addr = jl_ExecutionEngine->getFunctionAddress(gf_thunk_name);
     jl_gc_safe_leave(ct->ptls, gc_state);
     assert(Addr);
@@ -304,7 +305,7 @@ static std::condition_variable engine_wait;
 static int threads_in_compiler_phase;
   // the TSM for each codeinst
 static SmallVector<orc::ThreadSafeModule,0> sharedmodules;
-static DenseMap<jl_code_instance_t*, orc::ThreadSafeModule> emittedmodules;
+static DenseMap<jl_code_instance_t*, jl_codegen_output_t> emittedmodules;
   // the invoke and specsig function names in the JIT
 static DenseMap<jl_code_instance_t*, jl_llvm_functions_t> invokenames;
   // everything that any thread wants to compile right now
@@ -434,7 +435,7 @@ static int jl_analyze_workqueue(jl_code_instance_t *callee, jl_codegen_params_t 
                             else
                                 invokeName = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)invoke, invoke, codeinst);
                         }
-                        pinvoke = emit_tojlinvoke(codeinst, invokeName, mod, params);
+                        pinvoke = emit_tojlinvoke(codeinst, invokeName, *proto.output, params);
                         if (!proto.specsig) {
                             proto.decl->replaceAllUsesWith(pinvoke);
                             proto.decl->eraseFromParent();
@@ -455,7 +456,7 @@ static int jl_analyze_workqueue(jl_code_instance_t *callee, jl_codegen_params_t 
                         jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
                         size_t nrealargs = jl_nparams(mi->specTypes); // number of actual arguments being passed
                         bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_for_opaque_closure;
-                        emit_specsig_to_fptr1(proto.decl, proto.cc, proto.return_roots, mi->specTypes, codeinst->rettype, is_opaque_closure, nrealargs, params, pinvoke);
+                        emit_specsig_to_fptr1(*proto.output, proto.decl, proto.cc, proto.return_roots, mi->specTypes, codeinst->rettype, is_opaque_closure, nrealargs, params, pinvoke);
                         jl_gc_unsafe_leave(ct->ptls, gc_state);
                         preal_decl = ""; // no need to fixup the name
                     }
@@ -569,7 +570,7 @@ static void prepare_compile(jl_code_instance_t *codeinst) JL_NOTSAFEPOINT_LEAVE 
             params.tsctx_lock = params.tsctx.getLock();
             waiting = jl_analyze_workqueue(codeinst, params, true); // may safepoint
             assert(!waiting); (void)waiting;
-            Module *M = emittedmodules[codeinst].getModuleUnlocked();
+            Module *M = emittedmodules[codeinst].module();
             finish_params(M, params, sharedmodules);
             incompletemodules.erase(it);
         }
@@ -599,11 +600,11 @@ static void complete_emit(jl_code_instance_t *edge) JL_NOTSAFEPOINT_LEAVE JL_NOT
             auto &params = std::get<0>(it->second);
             params.tsctx_lock = params.tsctx.getLock();
             assert(callee == it->first);
-            orc::ThreadSafeModule &M = emittedmodules[callee];
+            jl_codegen_output_t &M = emittedmodules[callee];
             emit_always_inline(M, params); // may safepoint
             int waiting = jl_analyze_workqueue(callee, params); // may safepoint
             assert(!waiting); (void)waiting;
-            finish_params(M.getModuleUnlocked(), params, sharedmodules);
+            finish_params(M.module(), params, sharedmodules);
             incompletemodules.erase(it);
         }
     }
@@ -643,10 +644,10 @@ static void jl_compile_codeinst_now(jl_code_instance_t *codeinst)
             lock.native.unlock();
             uint64_t start_time = jl_hrtime();
             {
-                auto Lock = TSM.getContext().getLock();
-                jl_ExecutionEngine->optimizeDLSyms(*TSM.getModuleUnlocked()); // may safepoint
+                auto Lock = TSM.context().getLock();
+                jl_ExecutionEngine->optimizeDLSyms(*TSM.module()); // may safepoint
             }
-            jl_ExecutionEngine->addModule(std::move(TSM)); // may safepoint
+            jl_ExecutionEngine->addModule(std::move(TSM.mod)); // may safepoint
             // If logging of the compilation stream is enabled,
             // then dump the method-instance specialization type to the stream
             jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
@@ -777,16 +778,16 @@ void jl_emit_codeinst_to_jit_impl(
     params.getContext().setDiscardValueNames(true);
     params.cache = true;
     params.imaging_mode = 0;
-    orc::ThreadSafeModule result_m =
-        jl_create_ts_module(name_from_method_instance(jl_get_ci_mi(codeinst)), params.tsctx, params.DL, params.TargetTriple);
+    jl_codegen_output_t result_m =
+        jl_create_codegen_output(name_from_method_instance(jl_get_ci_mi(codeinst)), params.tsctx, params.DL, params.TargetTriple);
     params.temporary_roots = jl_alloc_array_1d(jl_array_any_type, 0);
     JL_GC_PUSH1(&params.temporary_roots);
     jl_llvm_functions_t decls = jl_emit_codeinst(result_m, codeinst, src, params); // contains safepoints
-    if (!result_m) {
+    if (!result_m.mod) {
         JL_GC_POP();
         return;
     }
-    jl_optimize_roots(params, jl_get_ci_mi(codeinst), *result_m.getModuleUnlocked()); // contains safepoints
+    jl_optimize_roots(params, jl_get_ci_mi(codeinst), *result_m.module()); // contains safepoints
     params.temporary_roots = nullptr;
     params.temporary_roots_set.clear();
     JL_GC_POP();
@@ -824,7 +825,7 @@ void jl_emit_codeinst_to_jit_impl(
         incompletemodules.try_emplace(codeinst, std::move(params), waiting);
     }
     else {
-        finish_params(result_m.getModuleUnlocked(), params, sharedmodules);
+        finish_params(result_m.module(), params, sharedmodules);
     }
     emittedmodules[codeinst] = std::move(result_m);
 }

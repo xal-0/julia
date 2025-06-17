@@ -204,11 +204,52 @@ struct jl_returninfo_t {
     unsigned return_roots;
 };
 
+class name_counter {
+public:
+    template<class... Ts>
+    std::string operator()(Ts... args)
+    {
+        std::string name;
+        raw_string_ostream s{name};
+        (s << ... << args);
+        s << "_" << jl_atomic_fetch_add_relaxed(&counter, 1);
+        return name;
+    }
+
+    name_counter() JL_NOTSAFEPOINT = default;
+    name_counter(const name_counter &other) JL_NOTSAFEPOINT
+      : counter(jl_atomic_load_relaxed(&other.counter))
+    {
+    }
+    name_counter &operator=(const name_counter &other) JL_NOTSAFEPOINT
+    {
+        jl_atomic_store_relaxed(&counter, jl_atomic_load_relaxed(&other.counter));
+        return *this;
+    }
+
+private:
+    _Atomic(uint64_t) counter = 1;
+};
+
+// Wraps the destination LLVM module and the metadata mapping julia values
+// (globals, codeinsts) to LLVM names.
+struct jl_codegen_output_t {
+    jl_codegen_output_t() = default;
+    jl_codegen_output_t(orc::ThreadSafeModule mod) : mod(std::move(mod)) {}
+    Module *module() { return mod.getModuleUnlocked(); }
+    orc::ThreadSafeContext context() { return mod.getContext(); }
+
+    orc::ThreadSafeModule mod;
+    DenseMap<void *, GlobalValue *> jl_values;
+    name_counter name_ctr;
+};
+
 struct jl_codegen_call_target_t {
     jl_returninfo_t::CallingConv cc;
     unsigned return_roots;
     llvm::Function *decl;
     llvm::Function *oc;
+    jl_codegen_output_t *output;
     bool specsig;
     bool external_linkage; // whether codegen would like this edge to be externally-available
     bool private_linkage; // whether codegen would like this edge to be internally-available
@@ -226,6 +267,7 @@ struct cfunc_decl_t {
     bool specsig;
     llvm::GlobalVariable *theFptr;
     llvm::GlobalVariable *cfuncdata;
+    jl_codegen_output_t *output;
 };
 
 typedef SmallVector<std::pair<jl_code_instance_t*, jl_codegen_call_target_t>, 0> jl_workqueue_t;
@@ -268,9 +310,6 @@ struct jl_codegen_params_t {
     DenseMap<AttributeList, std::map<
         std::tuple<GlobalVariable*, FunctionType*, CallingConv::ID>,
         GlobalVariable*>> allPltMap;
-    // When local_unique_names is enabled, maps from local name -> global name
-    StringMap<StringRef> local_names;
-    int name_counter = 0;
     std::unique_ptr<Module> _shared_module;
     inline Module &shared_module();
     // inputs
@@ -280,7 +319,6 @@ struct jl_codegen_params_t {
     bool imaging_mode;
     bool safepoint_on_entry = true;
     bool use_swiftcc = true;
-    bool local_unique_names = false;
     jl_codegen_params_t(orc::ThreadSafeContext ctx, DataLayout DL, Triple triple) JL_NOTSAFEPOINT  JL_NOTSAFEPOINT_ENTER
       : tsctx(std::move(ctx)),
         tsctx_lock(tsctx.getLock()),
@@ -296,10 +334,10 @@ struct jl_codegen_params_t {
     ~jl_codegen_params_t() JL_NOTSAFEPOINT JL_NOTSAFEPOINT_LEAVE = default;
 };
 
-const char *jl_generate_ccallable(Module *llvmmod, jl_value_t *nameval, jl_value_t *declrt, jl_value_t *sigt, jl_codegen_params_t &params);
+const char *jl_generate_ccallable(jl_codegen_output_t &out, jl_value_t *nameval, jl_value_t *declrt, jl_value_t *sigt, jl_codegen_params_t &params);
 
 jl_llvm_functions_t jl_emit_code(
-        orc::ThreadSafeModule &M,
+        jl_codegen_output_t &out,
         jl_method_instance_t *mi,
         jl_code_info_t *src,
         jl_value_t *abi_at,
@@ -307,18 +345,18 @@ jl_llvm_functions_t jl_emit_code(
         jl_codegen_params_t &params);
 
 jl_llvm_functions_t jl_emit_codeinst(
-        orc::ThreadSafeModule &M,
+        jl_codegen_output_t &out,
         jl_code_instance_t *codeinst,
         jl_code_info_t *src,
         jl_codegen_params_t &params);
 
 jl_llvm_functions_t jl_emit_codedecls(
-        orc::ThreadSafeModule &M,
+        jl_codegen_output_t &out,
         jl_code_instance_t *codeinst,
         jl_codegen_params_t &params);
 
 void linkFunctionBody(Function &Dst, Function &Src) JL_NOTSAFEPOINT;
-void emit_always_inline(orc::ThreadSafeModule &result_m, jl_codegen_params_t &params) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER;
+void emit_always_inline(jl_codegen_output_t &out, jl_codegen_params_t &params) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER;
 
 enum CompilationPolicy {
     Default = 0,
@@ -330,13 +368,14 @@ Function *jl_cfunction_object(jl_function_t *f, jl_value_t *rt, jl_tupletype_t *
 
 extern "C" JL_DLLEXPORT_CODEGEN
 void *jl_jit_abi_convert(jl_task_t *ct, jl_value_t *declrt, jl_value_t *sigt, size_t nargs, bool specsig, _Atomic(void*) *fptr, _Atomic(size_t) *last_world, void *data);
-std::string emit_abi_dispatcher(Module *M, jl_codegen_params_t &params, jl_value_t *declrt, jl_value_t *sigt, size_t nargs, bool specsig, jl_code_instance_t *codeinst, Value *invoke);
-std::string emit_abi_converter(Module *M, jl_codegen_params_t &params, jl_value_t *declrt, jl_value_t *sigt, size_t nargs, bool specsig, jl_code_instance_t *codeinst, Value *target, bool target_specsig);
-std::string emit_abi_constreturn(Module *M, jl_codegen_params_t &params, jl_value_t *declrt, jl_value_t *sigt, size_t nargs, bool specsig, jl_value_t *rettype_const);
-std::string emit_abi_constreturn(Module *M, jl_codegen_params_t &params, bool specsig, jl_code_instance_t *codeinst);
+std::string emit_abi_dispatcher(jl_codegen_output_t &out, jl_codegen_params_t &params, jl_value_t *declrt, jl_value_t *sigt, size_t nargs, bool specsig, jl_code_instance_t *codeinst, Value *invoke);
+std::string emit_abi_converter(jl_codegen_output_t &out, jl_codegen_params_t &params, jl_value_t *declrt, jl_value_t *sigt, size_t nargs, bool specsig, jl_code_instance_t *codeinst, Value *target, bool target_specsig);
+std::string emit_abi_constreturn(jl_codegen_output_t &out, jl_codegen_params_t &params, jl_value_t *declrt, jl_value_t *sigt, size_t nargs, bool specsig, jl_value_t *rettype_const);
+std::string emit_abi_constreturn(jl_codegen_output_t &out, jl_codegen_params_t &params, bool specsig, jl_code_instance_t *codeinst);
 
-Function *emit_tojlinvoke(jl_code_instance_t *codeinst, StringRef theFptrName, Module *M, jl_codegen_params_t &params) JL_NOTSAFEPOINT;
+Function *emit_tojlinvoke(jl_code_instance_t *codeinst, StringRef theFptrName, jl_codegen_output_t &out, jl_codegen_params_t &params) JL_NOTSAFEPOINT;
 void emit_specsig_to_fptr1(
+        jl_codegen_output_t &out,
         Function *gf_thunk, jl_returninfo_t::CallingConv cc, unsigned return_roots,
         jl_value_t *calltype, jl_value_t *rettype, bool is_for_opaque_closure,
         size_t nargs,
@@ -676,9 +715,9 @@ private:
 };
 extern JuliaOJIT *jl_ExecutionEngine;
 std::unique_ptr<Module> jl_create_llvm_module(StringRef name, LLVMContext &ctx, const DataLayout &DL, const Triple &triple) JL_NOTSAFEPOINT;
-inline orc::ThreadSafeModule jl_create_ts_module(StringRef name, orc::ThreadSafeContext ctx, const DataLayout &DL, const Triple &triple) JL_NOTSAFEPOINT {
+inline jl_codegen_output_t jl_create_codegen_output(StringRef name, orc::ThreadSafeContext ctx, const DataLayout &DL, const Triple &triple) JL_NOTSAFEPOINT {
     auto lock = ctx.getLock();
-    return orc::ThreadSafeModule(jl_create_llvm_module(name, *ctx.getContext(), DL, triple), ctx);
+    return {orc::ThreadSafeModule(jl_create_llvm_module(name, *ctx.getContext(), DL, triple), ctx)};
 }
 
 Module &jl_codegen_params_t::shared_module() JL_NOTSAFEPOINT {
