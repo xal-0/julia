@@ -49,6 +49,28 @@ typedef struct {
     alignas(JL_CACHE_BYTE_ALIGNMENT) _Atomic(ws_array_t *) array;
 } ws_queue_t;
 
+#ifdef _COMPILER_TSAN_ENABLED_
+#define MEMCPY_FROM_RELAXED(dest, src, count) memcpy_from_relaxed((uintptr_t *)(dest), (_Atomic(uintptr_t) *)(src), count)
+#define MEMCPY_TO_RELAXED(dest, src, count) memcpy_to_relaxed((_Atomic(uintptr_t) *)(dest), (uintptr_t *)(src), count)
+static void memcpy_from_relaxed(uintptr_t *dest, _Atomic(uintptr_t) *src, size_t count) {
+    assert(((uintptr_t)dest & sizeof(uintptr_t)-1) == 0);
+    assert(((uintptr_t)src & sizeof(uintptr_t)-1) == 0);
+    assert(((uintptr_t)count & sizeof(uintptr_t)-1) == 0);
+    for (size_t i = 0; i < count; i += sizeof(uintptr_t))
+        *dest++ = jl_atomic_load_relaxed(src++);
+}
+static void memcpy_to_relaxed(_Atomic(uintptr_t) *dest, uintptr_t *src, size_t count) {
+    assert(((uintptr_t)dest & sizeof(uintptr_t)-1) == 0);
+    assert(((uintptr_t)src & sizeof(uintptr_t)-1) == 0);
+    assert(((uintptr_t)count & sizeof(uintptr_t)-1) == 0);
+    for (size_t i = 0; i < count; i += sizeof(uintptr_t))
+        jl_atomic_store_relaxed(dest++, *src++);
+}
+#else
+#define MEMCPY_FROM_RELAXED memcpy
+#define MEMCPY_TO_RELAXED memcpy
+#endif
+
 static inline ws_array_t *ws_queue_push(ws_queue_t *q, void *elt, int32_t eltsz) JL_NOTSAFEPOINT
 {
     int64_t b = jl_atomic_load_relaxed(&q->bottom);
@@ -58,13 +80,13 @@ static inline ws_array_t *ws_queue_push(ws_queue_t *q, void *elt, int32_t eltsz)
     if (__unlikely(b - t > ary->capacity - 1)) {
         ws_array_t *new_ary = create_ws_array(2 * ary->capacity, eltsz);
         for (int i = 0; i < ary->capacity; i++) {
-            memcpy(new_ary->buffer + ((t + i) & new_ary->mask) * eltsz, ary->buffer + ((t + i) & ary->mask) * eltsz, eltsz);
+            MEMCPY_TO_RELAXED(new_ary->buffer + ((t + i) & new_ary->mask) * eltsz, ary->buffer + ((t + i) & ary->mask) * eltsz, eltsz);
         }
         jl_atomic_store_release(&q->array, new_ary);
         old_ary = ary;
         ary = new_ary;
     }
-    memcpy(ary->buffer + (b & ary->mask) * eltsz, elt, eltsz);
+    MEMCPY_TO_RELAXED(ary->buffer + (b & ary->mask) * eltsz, elt, eltsz);
     jl_fence_release();
     jl_atomic_store_relaxed(&q->bottom, b + 1);
     return old_ary;
@@ -78,7 +100,7 @@ static inline void ws_queue_pop(ws_queue_t *q, void *dest, int32_t eltsz) JL_NOT
     jl_fence();
     int64_t t = jl_atomic_load_relaxed(&q->top);
     if (__likely(t <= b)) {
-        memcpy(dest, ary->buffer + (b & ary->mask) * eltsz, eltsz);
+        MEMCPY_FROM_RELAXED(dest, ary->buffer + (b & ary->mask) * eltsz, eltsz);
         if (t == b) {
             if (!jl_atomic_cmpswap(&q->top, &t, t + 1))
                 memset(dest, 0, eltsz);
@@ -98,11 +120,14 @@ static inline void ws_queue_steal_from(ws_queue_t *q, void *dest, int32_t eltsz)
     int64_t b = jl_atomic_load_acquire(&q->bottom);
     if (t < b) {
         ws_array_t *ary = jl_atomic_load_relaxed(&q->array);
-        memcpy(dest, ary->buffer + (t & ary->mask) * eltsz, eltsz);
+        MEMCPY_FROM_RELAXED(dest, ary->buffer + (t & ary->mask) * eltsz, eltsz);
         if (!jl_atomic_cmpswap(&q->top, &t, t + 1))
             memset(dest, 0, eltsz);
     }
 }
+
+#undef MEMCPY_FROM_RELAXED
+#undef MEMCPY_TO_RELAXED
 
 #ifdef __cplusplus
 }
