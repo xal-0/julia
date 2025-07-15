@@ -234,7 +234,7 @@ static void gc_sync_all_caches(jl_ptls_t ptls)
 FORCE_INLINE int gc_try_setmark_tag(jl_taggedvalue_t *o, uint8_t mark_mode) JL_NOTSAFEPOINT
 {
     assert(gc_marked(mark_mode));
-    uintptr_t tag = o->header;
+    uintptr_t tag = jl_load_header(o);
     if (gc_marked(tag))
         return 0;
     if (mark_reset_age) {
@@ -321,7 +321,7 @@ STATIC_INLINE void gc_setmark(jl_ptls_t ptls, jl_taggedvalue_t *o,
 STATIC_INLINE void gc_setmark_buf_(jl_ptls_t ptls, void *o, uint8_t mark_mode, size_t minsz) JL_NOTSAFEPOINT
 {
     jl_taggedvalue_t *buf = jl_astaggedvalue(o);
-    uint8_t bits = (gc_old(buf->header) && !mark_reset_age) ? GC_OLD_MARKED : GC_MARKED;;
+    uint8_t bits = (gc_old(jl_load_header(buf)) && !mark_reset_age) ? GC_OLD_MARKED : GC_MARKED;;
     // If the object is larger than the max pool size it can't be a pool object.
     // This should be accurate most of the time but there might be corner cases
     // where the size estimate is a little off so we do a pool lookup to make
@@ -1685,7 +1685,7 @@ STATIC_INLINE void gc_try_claim_and_push(jl_gc_markqueue_t *mq, void *_obj,
         return;
     jl_value_t *obj = (jl_value_t *)jl_assume(_obj);
     jl_taggedvalue_t *o = jl_astaggedvalue(obj);
-    if (!gc_old(o->header) && nptr)
+    if (!gc_old(jl_load_header(o)) && nptr)
         *nptr |= 1;
     if (gc_try_setmark_tag(o, GC_MARKED))
         gc_ptr_queue_push(mq, obj);
@@ -1713,7 +1713,7 @@ STATIC_INLINE jl_value_t *gc_mark_obj8(jl_ptls_t ptls, char *obj8_parent, uint8_
                 // Unroll marking of last item to avoid pushing
                 // and popping it right away
                 jl_taggedvalue_t *o = jl_astaggedvalue(new_obj);
-                nptr |= !gc_old(o->header);
+                nptr |= !gc_old(jl_load_header(o));
                 if (!gc_try_setmark_tag(o, GC_MARKED)) new_obj = NULL;
             }
             gc_heap_snapshot_record_object_edge((jl_value_t*)obj8_parent, slot);
@@ -1745,7 +1745,7 @@ STATIC_INLINE jl_value_t *gc_mark_obj16(jl_ptls_t ptls, char *obj16_parent, uint
                 // Unroll marking of last item to avoid pushing
                 // and popping it right away
                 jl_taggedvalue_t *o = jl_astaggedvalue(new_obj);
-                nptr |= !gc_old(o->header);
+                nptr |= !gc_old(jl_load_header(o));
                 if (!gc_try_setmark_tag(o, GC_MARKED)) new_obj = NULL;
             }
             gc_heap_snapshot_record_object_edge((jl_value_t*)obj16_parent, slot);
@@ -1777,7 +1777,7 @@ STATIC_INLINE jl_value_t *gc_mark_obj32(jl_ptls_t ptls, char *obj32_parent, uint
                 // Unroll marking of last item to avoid pushing
                 // and popping it right away
                 jl_taggedvalue_t *o = jl_astaggedvalue(new_obj);
-                nptr |= !gc_old(o->header);
+                nptr |= !gc_old(jl_load_header(o));
                 if (!gc_try_setmark_tag(o, GC_MARKED)) new_obj = NULL;
             }
             gc_heap_snapshot_record_object_edge((jl_value_t*)obj32_parent, slot);
@@ -1807,9 +1807,10 @@ STATIC_INLINE void gc_mark_objarray(jl_ptls_t ptls, jl_value_t *obj_parent, jl_v
                 verify_parent2("obj array", obj_parent, obj_begin, "elem(%d)",
                                gc_slot_to_arrayidx(obj_parent, obj_begin));
                 jl_taggedvalue_t *o = jl_astaggedvalue(new_obj);
-                if (!gc_old(o->header))
+                uintptr_t bits = jl_load_header(o);
+                if (!gc_old(bits))
                     nptr |= 1;
-                if (!gc_marked(o->header))
+                if (!gc_marked(bits))
                     break;
                 gc_heap_snapshot_record_array_edge(obj_parent, slot);
             }
@@ -1877,9 +1878,10 @@ STATIC_INLINE void gc_mark_memory8(jl_ptls_t ptls, jl_value_t *ary8_parent, jl_v
                     verify_parent2("array", ary8_parent, &new_obj, "elem(%d)",
                                 gc_slot_to_arrayidx(ary8_parent, ary8_begin));
                     jl_taggedvalue_t *o = jl_astaggedvalue(new_obj);
-                    if (!gc_old(o->header))
+                    uintptr_t bits = jl_load_header(o);
+                    if (!gc_old(bits))
                         nptr |= 1;
-                    if (!gc_marked(o->header)){
+                    if (!gc_marked(bits)){
                         early_end = 1;
                         break;
                     }
@@ -1954,9 +1956,10 @@ STATIC_INLINE void gc_mark_memory16(jl_ptls_t ptls, jl_value_t *ary16_parent, jl
                     verify_parent2("array", ary16_parent, &new_obj, "elem(%d)",
                                 gc_slot_to_arrayidx(ary16_parent, ary16_begin));
                     jl_taggedvalue_t *o = jl_astaggedvalue(new_obj);
-                    if (!gc_old(o->header))
+                    uintptr_t bits = jl_load_header(o);
+                    if (!gc_old(bits))
                         nptr |= 1;
-                    if (!gc_marked(o->header)){
+                    if (!gc_marked(bits)){
                         early_end = 1;
                         break;
                     }
@@ -2243,8 +2246,9 @@ FORCE_INLINE void gc_mark_outrefs(jl_ptls_t ptls, jl_gc_markqueue_t *mq, void *_
     jl_value_t *new_obj = (jl_value_t *)((uintptr_t)_new_obj & ~(uintptr_t)GC_REMSET_PTR_TAG);
     mark_obj: {
         jl_taggedvalue_t *o = jl_astaggedvalue(new_obj);
-        uintptr_t vtag = o->header & ~(uintptr_t)0xf;
-        uint8_t bits = (gc_old(o->header) && !mark_reset_age) ? GC_OLD_MARKED : GC_MARKED;
+        uintptr_t header = jl_load_header(o);
+        uintptr_t vtag = header & ~(uintptr_t)0xf;
+        uint8_t bits = (gc_old(header) && !mark_reset_age) ? GC_OLD_MARKED : GC_MARKED;
         int update_meta = __likely(!meta_updated && !gc_verifying);
         int foreign_alloc = 0;
         if (update_meta && o->bits.in_image) {
@@ -4080,7 +4084,7 @@ JL_DLLEXPORT jl_value_t *jl_gc_internal_obj_base_ptr(void *p)
         // as they must not be passed to the usual marking functions.
         // Note that jl_buff_tag is real pointer into libjulia,
         // thus it cannot be a type reference.
-        if ((cell->header & ~(uintptr_t) 3) == jl_buff_tag)
+        if ((jl_load_header(cell) & ~(uintptr_t) 3) == jl_buff_tag)
             return NULL;
         return jl_valueof(cell);
     }

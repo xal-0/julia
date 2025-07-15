@@ -367,7 +367,7 @@ static uintptr_t type_object_id_(jl_value_t *v, jl_varidx_t *env) JL_NOTSAFEPOIN
             i++;
             pe = pe->prev;
         }
-        uintptr_t bits = jl_astaggedvalue(v)->header;
+        uintptr_t bits = jl_headerof(v);
         if (bits & GC_IN_IMAGE)
             return ((uintptr_t*)v)[-2];
         return inthash((uintptr_t)v);

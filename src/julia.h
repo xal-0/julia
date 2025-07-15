@@ -108,6 +108,7 @@ JL_EXTENSION struct _jl_taggedvalue_t {
 };
 
 static inline jl_value_t *jl_to_typeof(uintptr_t t) JL_GLOBALLY_ROOTED JL_NOTSAFEPOINT;
+
 #ifdef __clang_gcanalyzer__
 JL_DLLEXPORT jl_taggedvalue_t *_jl_astaggedvalue(jl_value_t *v JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT;
 #define jl_astaggedvalue(v) _jl_astaggedvalue((jl_value_t*)(v))
@@ -116,6 +117,10 @@ jl_value_t *_jl_valueof(jl_taggedvalue_t *tv JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT
 JL_DLLEXPORT jl_value_t *_jl_typeof(jl_value_t *v JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT;
 #define jl_typeof(v) (_jl_typeof((jl_value_t*)(v)))
 #define jl_typetagof(v) ((uintptr_t)_jl_typeof((jl_value_t*)(v)))
+#define jl_headerof(v)                                                  \
+    (jl_astaggedvalue(v)->header)
+#define jl_load_header(v)                                               \
+    (v->header)
 #else
 #define jl_astaggedvalue(v)                                             \
     ((jl_taggedvalue_t*)((char*)(v) - sizeof(jl_taggedvalue_t)))
@@ -124,7 +129,21 @@ JL_DLLEXPORT jl_value_t *_jl_typeof(jl_value_t *v JL_PROPAGATES_ROOT) JL_NOTSAFE
 #define jl_typeof(v)                                                    \
     jl_to_typeof(jl_typetagof(v))
 #define jl_typetagof(v)                                                 \
-    ((jl_astaggedvalue(v)->header) & ~(uintptr_t)15)
+    (jl_headerof(v) & ~(uintptr_t)15)
+#define jl_headerof(v)                                                  \
+    (jl_load_header(jl_astaggedvalue(v)))
+
+#ifdef _COMPILER_TSAN_ENABLED_
+    // Almost all accesses to the header should be relaxed atomic because of the
+    // GC, but compilers avoid important optimizations on relaxed atomic ops, so
+    // we do this only when tsan is enabled.
+#define jl_load_header(v)                                               \
+    (jl_atomic_load_relaxed((_Atomic(uintptr_t) *)&v->header))
+#else
+#define jl_load_header(v)                                               \
+    (v->header)
+#endif
+
 #endif
 static inline void jl_set_typeof(void *v, void *t) JL_NOTSAFEPOINT
 {
