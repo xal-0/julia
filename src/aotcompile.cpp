@@ -1614,6 +1614,16 @@ static AOTOutputs add_output_impl(Module &M, TargetMachine &SourceTM, ShardTimer
                     FunctionType::get(Type::getBFloatTy(M.getContext()), { Type::getFloatTy(M.getContext()) }, false));
             injectCRTAlias(M, "__truncsdbf2", "julia__truncdfbf2",
                     FunctionType::get(Type::getBFloatTy(M.getContext()), { Type::getDoubleTy(M.getContext()) }, false));
+
+#ifdef _COMPILER_TSAN_ENABLED_
+            {
+                auto &C = M.getContext();
+                auto ptrty = PointerType::get(C, 0);
+                injectCRTAlias(M, "__llvm_memset_element_unordered_atomic_1", "jl_memset_element_unordered_atomic_1",
+                               FunctionType::get(ptrty, { ptrty, Type::getInt8Ty(C), M.getDataLayout().getIntPtrType(C) }, false));
+            }
+#endif
+
         }
         timers.optimize.stopTimer();
     }

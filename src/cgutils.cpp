@@ -4523,7 +4523,11 @@ static void emit_memory_zeroinit_and_stores(jl_codectx_t &ctx, jl_datatype_t *ty
         aliasinfo = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_memoryptr);
         aliasinfo.decorateInst(load);
         auto int8t = getInt8Ty(ctx.builder.getContext());
+#ifdef _COMPILER_TSAN_ENABLED_
+        ctx.builder.CreateElementUnorderedAtomicMemSet(load, ConstantInt::get(int8t, 0), nbytes, Align(sizeof(void*)), 1);
+#else
         ctx.builder.CreateMemSet(load, ConstantInt::get(int8t, 0), nbytes, Align(sizeof(void*)));
+#endif
     }
     return;
 }

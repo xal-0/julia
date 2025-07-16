@@ -1759,3 +1759,14 @@ JL_DLLEXPORT jl_value_t *jl_sub_ptr(jl_value_t *ptr, jl_value_t *offset)
     char *ptrval = (char*)jl_unbox_long(ptr) - jl_unbox_ulong(offset);
     return jl_new_bits(jl_typeof(ptr), &ptrval);
 }
+
+#ifdef _COMPILER_TSAN_ENABLED_
+JL_DLLEXPORT void *jl_memset_element_unordered_atomic_1(void *dest, char val, size_t len,
+                                                        char vol)
+{
+    _Atomic(char) *end = (_Atomic(char) *)dest + len;
+    for (_Atomic(char) *p = dest; p < end; p++)
+        jl_atomic_store_relaxed(p, val);
+    return dest;
+}
+#endif
