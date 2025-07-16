@@ -1678,6 +1678,7 @@ static jl_cgval_t emit_ccall(jl_codectx_t &ctx, jl_value_t **args, size_t nargs)
         Value *ptid = ctx.builder.CreateInBoundsGEP(getInt8Ty(ctx.builder.getContext()), ptask, ConstantInt::get(ctx.types().T_size, tid_offset / sizeof(int8_t)));
         setName(ctx.emission_context, ptid, "thread_id_ptr");
         LoadInst *tid = ctx.builder.CreateAlignedLoad(getInt16Ty(ctx.builder.getContext()), ptid, Align(sizeof(int16_t)));
+        tid->setAtomic(AtomicOrdering::Monotonic);
         setName(ctx.emission_context, tid, "thread_id");
         jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_gcframe);
         ai.decorateInst(tid);
