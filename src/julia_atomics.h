@@ -245,8 +245,16 @@ extern "C" {
     atomic_load(obj)
 #  define jl_atomic_load_acquire(obj)           \
     atomic_load_explicit(obj, memory_order_acquire)
+#ifdef _COMPILER_TSAN_ENABLED_
+// For the sake of tsan, call these loads consume ordering since they will act
+// as such on the processors we support while normally, the compiler would
+// upgrade this to acquire ordering, which is strong (and slower) than we want.
+#  define jl_atomic_load_relaxed(obj)           \
+    atomic_load_explicit(obj, memory_order_consume)
+#else
 #  define jl_atomic_load_relaxed(obj)           \
     atomic_load_explicit(obj, memory_order_relaxed)
+#endif
 #endif
 
 #ifdef __clang_gcanalyzer__
