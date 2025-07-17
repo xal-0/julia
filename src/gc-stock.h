@@ -88,14 +88,14 @@ extern uintptr_t gc_bigval_sentinel_tag;
 typedef struct _jl_gc_pagemeta_t {
     // next metadata structure in per-thread list
     // or in one of the `jl_gc_page_stack_t`
-    struct _jl_gc_pagemeta_t *next;
+    _Atomic(struct _jl_gc_pagemeta_t *) next;
     // index of pool that owns this page
     uint8_t pool_n;
     // Whether any cell in the page is marked
     // This bit is set before sweeping iff there are live cells in the page.
     // Note that before marking or after sweeping there can be live
     // (and young) cells in the page for `!has_marked`.
-    uint8_t has_marked;
+    _Atomic(uint8_t) has_marked;
     // Whether any cell was live and young **before sweeping**.
     // For a normal sweep (quick sweep that is NOT preceded by a
     // full sweep) this bit is set iff there are young or newly dead
@@ -138,7 +138,7 @@ extern jl_gc_page_stack_t global_page_pool_freed;
 STATIC_INLINE void push_lf_back_nosync(jl_gc_page_stack_t *pool, jl_gc_pagemeta_t *elt) JL_NOTSAFEPOINT
 {
     jl_gc_pagemeta_t *old_back = jl_atomic_load_relaxed(&pool->bottom);
-    elt->next = old_back;
+    jl_atomic_store_relaxed(&elt->next, old_back);
     jl_atomic_store_relaxed(&pool->bottom, elt);
 }
 
@@ -148,7 +148,7 @@ STATIC_INLINE jl_gc_pagemeta_t *pop_lf_back_nosync(jl_gc_page_stack_t *pool) JL_
     if (old_back == NULL) {
         return NULL;
     }
-    jl_atomic_store_relaxed(&pool->bottom, old_back->next);
+    jl_atomic_store_relaxed(&pool->bottom, jl_atomic_load_relaxed(&old_back->next));
     return old_back;
 }
 
@@ -156,7 +156,7 @@ STATIC_INLINE void push_lf_back(jl_gc_page_stack_t *pool, jl_gc_pagemeta_t *elt)
 {
     while (1) {
         jl_gc_pagemeta_t *old_back = jl_atomic_load_relaxed(&pool->bottom);
-        elt->next = old_back;
+        jl_atomic_store_relaxed(&elt->next, old_back);
         if (jl_atomic_cmpswap(&pool->bottom, &old_back, elt)) {
             break;
         }
@@ -173,7 +173,7 @@ STATIC_INLINE jl_gc_pagemeta_t *try_pop_lf_back(jl_gc_page_stack_t *pool) JL_NOT
         if (old_back == NULL) {
             return NULL;
         }
-        if (jl_atomic_cmpswap(&pool->bottom, &old_back, old_back->next)) {
+        if (jl_atomic_cmpswap(&pool->bottom, &old_back, jl_atomic_load_relaxed(&old_back->next))) {
             return old_back;
         }
         jl_cpu_pause();
@@ -188,7 +188,7 @@ STATIC_INLINE jl_gc_pagemeta_t *pop_lf_back(jl_gc_page_stack_t *pool) JL_NOTSAFE
         if (old_back == NULL) {
             return NULL;
         }
-        if (jl_atomic_cmpswap(&pool->bottom, &old_back, old_back->next)) {
+        if (jl_atomic_cmpswap(&pool->bottom, &old_back, jl_atomic_load_relaxed(&old_back->next))) {
             return old_back;
         }
         jl_cpu_pause();

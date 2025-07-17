@@ -14,8 +14,8 @@ extern "C" {
 STATIC_INLINE void jl_gc_wb(const void *parent, const void *ptr) JL_NOTSAFEPOINT
 {
     // parent and ptr isa jl_value_t*
-    if (__unlikely(jl_astaggedvalue(parent)->bits.gc == 3 /* GC_OLD_MARKED */ && // parent is old and not in remset
-                   (jl_astaggedvalue(ptr)->bits.gc & 1 /* GC_MARKED */) == 0)) // ptr is young
+    if (__unlikely((jl_headerof(parent) & 3) == 3 /* GC_OLD_MARKED */ && // parent is old and not in remset
+                   ((jl_headerof(ptr) & 1) /* GC_MARKED */) == 0)) // ptr is young
         jl_gc_queue_root((jl_value_t*)parent);
 }
 

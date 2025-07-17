@@ -301,7 +301,7 @@ STATIC_INLINE void gc_setmark_pool_(jl_ptls_t ptls, jl_taggedvalue_t *o,
             page->has_young = 1;
         }
     }
-    page->has_marked = 1;
+    jl_atomic_store_relaxed(&page->has_marked, 1);
 #endif
 }
 
