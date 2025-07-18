@@ -2016,9 +2016,6 @@ JuliaOJIT::JuliaOJIT()
         // BFloat16 conversion routines
         { mangle("__truncsfbf2"),   { mangle("julia__truncsfbf2"),    JITSymbolFlags::Exported } },
         { mangle("__truncdfbf2"),   { mangle("julia__truncdfbf2"),    JITSymbolFlags::Exported } },
-#ifdef _COMPILER_TSAN_ENABLED_
-        { mangle("__llvm_memset_element_unordered_atomic_1"), { mangle("jl_memset_element_unordered_atomic_1"), JITSymbolFlags::Exported } },
-#endif
     };
     cantFail(GlobalJD.define(orc::symbolAliases(jl_crt)));
 
