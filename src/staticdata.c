@@ -1579,15 +1579,6 @@ static void record_external_fns(jl_serializer_state *s, arraylist_t *external_fn
 #endif
 }
 
-#define RELOC_GC_TAGGED 1
-
-static void write_lazy_reloc(jl_serializer_state *s, void *v, uintptr_t flags)
-{
-    arraylist_push(&s->lazy_relocs, (void*)(uintptr_t)ios_pos(s->s));
-    arraylist_push(&s->lazy_relocs, (void*)backref_id(s, v, NULL));
-    arraylist_push(&s->lazy_relocs, (void*)flags);
-}
-
 jl_value_t *jl_find_ptr = NULL;
 
 // The main function for serializing all the items queued in `serialization_order`
@@ -4083,15 +4074,6 @@ static void jl_save_system_image2_to_stream(ios_t *f, jl_array_t *mod_array,
             jl_write_value(&s, s.method_roots_list);
             jl_write_value(&s, edges);
         }
-        write_uint32(f, jl_array_len(s.link_ids_gctags));
-        ios_write(f, (char*)jl_array_data(s.link_ids_gctags, uint32_t), jl_array_len(s.link_ids_gctags) * sizeof(uint32_t));
-        write_uint32(f, jl_array_len(s.link_ids_relocs));
-        ios_write(f, (char*)jl_array_data(s.link_ids_relocs, uint32_t), jl_array_len(s.link_ids_relocs) * sizeof(uint32_t));
-        write_uint32(f, jl_array_len(s.link_ids_gvars));
-        ios_write(f, (char*)jl_array_data(s.link_ids_gvars, uint32_t), jl_array_len(s.link_ids_gvars) * sizeof(uint32_t));
-        write_uint32(f, jl_array_len(s.link_ids_external_fnvars));
-        ios_write(f, (char*)jl_array_data(s.link_ids_external_fnvars, uint32_t), jl_array_len(s.link_ids_external_fnvars) * sizeof(uint32_t));
-        write_uint32(f, external_fns_begin);
     }
 
     assert(object_worklist.len == 0);
@@ -4969,7 +4951,7 @@ static void jl_restore_system_image2_from_stream_(
     s.s = f;
     uintptr_t offset_restored = 0, offset_init_order = 0, offset_extext_methods = 0, offset_new_ext_cis = 0, offset_method_roots_list = 0;
     uintptr_t offset_edges = 0;
-    if (!s.incremental) {
+    {
         size_t i;
         for (i = 0; tags[i] != NULL; i++) {
             jl_value_t **tag = tags[i];
@@ -4997,36 +4979,7 @@ static void jl_restore_system_image2_from_stream_(
         jl_typeinf_world = read_uint(f);
         jl_set_gs_ctr(gs_ctr);
     }
-    else {
-        offset_restored = jl_read_offset(&s);
-        offset_init_order = jl_read_offset(&s);
-        offset_extext_methods = jl_read_offset(&s);
-        offset_new_ext_cis = jl_read_offset(&s);
-        offset_method_roots_list = jl_read_offset(&s);
-        offset_edges = jl_read_offset(&s);
-    }
     s.buildid_depmods_idxs = depmod_to_imageidx(depmods);
-    size_t nlinks_gctags = read_uint32(f);
-    if (nlinks_gctags > 0) {
-        s.link_ids_gctags = jl_alloc_array_1d(jl_array_int32_type, nlinks_gctags);
-        ios_read(f, (char*)jl_array_data(s.link_ids_gctags, uint32_t), nlinks_gctags * sizeof(uint32_t));
-    }
-    size_t nlinks_relocs = read_uint32(f);
-    if (nlinks_relocs > 0) {
-        s.link_ids_relocs = jl_alloc_array_1d(jl_array_int32_type, nlinks_relocs);
-        ios_read(f, (char*)jl_array_data(s.link_ids_relocs, uint32_t), nlinks_relocs * sizeof(uint32_t));
-    }
-    size_t nlinks_gvars = read_uint32(f);
-    if (nlinks_gvars > 0) {
-        s.link_ids_gvars = jl_alloc_array_1d(jl_array_int32_type, nlinks_gvars);
-        ios_read(f, (char*)jl_array_data(s.link_ids_gvars, uint32_t), nlinks_gvars * sizeof(uint32_t));
-    }
-    size_t nlinks_external_fnvars = read_uint32(f);
-    if (nlinks_external_fnvars > 0) {
-        s.link_ids_external_fnvars = jl_alloc_array_1d(jl_array_int32_type, nlinks_external_fnvars);
-        ios_read(f, (char*)jl_array_data(s.link_ids_external_fnvars, uint32_t), nlinks_external_fnvars * sizeof(uint32_t));
-    }
-    uint32_t external_fns_begin = read_uint32(f);
     if (s.incremental) {
         assert(restored && init_order && extext_methods && internal_methods && new_ext_cis && method_roots_list && edges);
         *restored = (jl_array_t*)jl_delayed_reloc(&s, offset_restored);
@@ -5056,13 +5009,8 @@ static void jl_restore_system_image2_from_stream_(
     jl_read_memreflist(&s); // memref_list relocs
     // s.link_ids_gvars will be processed in `jl_update_all_gvars`
     // s.link_ids_external_fns will be processed in `jl_update_all_gvars`
-    jl_update_all_gvars(&s, image, external_fns_begin); // gvars relocs
-    if (s.incremental) {
-        jl_read_arraylist(s.relocs, &s.uniquing_types);
-        jl_read_arraylist(s.relocs, &s.uniquing_objs);
-        jl_read_arraylist(s.relocs, &s.fixup_types);
-    }
-    else {
+    jl_update_all_gvars(&s, image, 0xffffffff); // gvars relocs
+    {
         arraylist_new(&s.uniquing_types, 0);
         arraylist_new(&s.uniquing_objs, 0);
         arraylist_new(&s.fixup_types, 0);
@@ -5078,296 +5026,7 @@ static void jl_restore_system_image2_from_stream_(
     //   written to allow lookup/reconstruction), then we have to update references to that "reconstructable blob":
     //   instead of performing the relocation within the package image, we instead (re)direct all references
     //   to the external object.
-    arraylist_t cleanup_list;
-    arraylist_new(&cleanup_list, 0);
-    arraylist_t delay_list;
-    arraylist_new(&delay_list, 0);
-    JL_LOCK(&typecache_lock); // Might GC--prevent other threads from changing any type caches while we inspect them all
-    for (size_t i = 0; i < s.uniquing_types.len; i++) {
-        uintptr_t item = (uintptr_t)s.uniquing_types.items[i];
-        // check whether we are operating on the typetag
-        // (needing to ignore GC bits) or a regular field
-        // and check whether this is a gvar index
-        int tag = (item & 3);
-        item &= ~(uintptr_t)3;
-        uintptr_t *pfld;
-        jl_value_t **obj, *newobj;
-        if (tag == 3) {
-            obj = (jl_value_t**)(image_base + item);
-            pfld = NULL;
-            for (size_t i = 0; i < delay_list.len; i += 2) {
-                if (obj == (jl_value_t **)delay_list.items[i + 0]) {
-                    pfld = (uintptr_t*)delay_list.items[i + 1];
-                    delay_list.items[i + 1] = arraylist_pop(&delay_list);
-                    delay_list.items[i + 0] = arraylist_pop(&delay_list);
-                    break;
-                }
-            }
-            assert(pfld);
-        }
-        else if (tag == 2) {
-            if (image->gvars_base == NULL)
-                continue;
-            item >>= 2;
-            assert(item < s.gvar_record->size / sizeof(reloc_t));
-            pfld = sysimg_gvars(image->gvars_base, image->gvars_offsets, item);
-            obj = *(jl_value_t***)pfld;
-        }
-        else {
-            pfld = (uintptr_t*)(image_base + item);
-            if (tag == 1)
-                obj = (jl_value_t**)jl_typeof(jl_valueof(pfld));
-            else
-                obj = *(jl_value_t***)pfld;
-            if ((char*)obj > (char*)pfld) {
-                // this must be the super field
-                assert(tag == 0);
-                arraylist_push(&delay_list, obj);
-                arraylist_push(&delay_list, pfld);
-                ptrhash_put(&new_dt_objs, (void*)obj, obj); // mark obj as invalid
-                *pfld = (uintptr_t)NULL;
-                continue;
-            }
-        }
-        uintptr_t otyp = jl_typetagof(obj);   // the original type of the object that was written here
-        assert(image_base < (char*)obj && (char*)obj <= image_base + sizeof_sysimg);
-        if (otyp == jl_datatype_tag << 4) {
-            jl_datatype_t *dt = (jl_datatype_t*)obj[0], *newdt;
-            if (jl_is_datatype(dt)) {
-                newdt = dt; // already done
-            }
-            else {
-                dt = (jl_datatype_t*)obj;
-                arraylist_push(&cleanup_list, (void*)obj);
-                ptrhash_remove(&new_dt_objs, (void*)obj); // unmark obj as invalid before must_be_new_dt
-                if (must_be_new_dt((jl_value_t*)dt, &new_dt_objs, image_base, sizeof_sysimg))
-                    newdt = NULL;
-                else
-                    newdt = jl_lookup_cache_type_(dt);
-                if (newdt == NULL) {
-                    // make a non-owned copy of obj so we don't accidentally
-                    // assume this is the unique copy later
-                    newdt = jl_new_uninitialized_datatype();
-                    jl_astaggedvalue(newdt)->bits.gc = GC_OLD;
-                    // leave most fields undefined for now, but we may need instance later,
-                    // and we overwrite the name field (field 0) now so preserve it too
-                    if (dt->instance) {
-                        if (dt->instance == jl_nothing)
-                            dt->instance = jl_gc_permobj(0, newdt, 0);
-                        newdt->instance = dt->instance;
-                    }
-                    static_assert(offsetof(jl_datatype_t, name) == 0, "");
-                    newdt->name = dt->name;
-                    ptrhash_put(&new_dt_objs, (void*)newdt, dt);
-                }
-                else {
-                    assert(newdt->hash == dt->hash);
-                }
-                obj[0] = (jl_value_t*)newdt;
-            }
-            newobj = (jl_value_t*)newdt;
-        }
-        else {
-            assert(!(image_base < (char*)otyp && (char*)otyp <= image_base + sizeof_sysimg));
-            newobj = ((jl_datatype_t*)otyp)->instance;
-            assert(newobj && newobj != jl_nothing);
-            arraylist_push(&cleanup_list, (void*)obj);
-        }
-        if (tag == 1)
-            *pfld = (uintptr_t)newobj | GC_OLD | GC_IN_IMAGE;
-        else
-            *pfld = (uintptr_t)newobj;
-        assert(!(image_base < (char*)newobj && (char*)newobj <= image_base + sizeof_sysimg));
-        assert(jl_typetagis(obj, otyp));
-    }
-    assert(delay_list.len == 0);
-    arraylist_free(&delay_list);
-    // now that all the fields of dt are assigned and unique, copy them into
-    // their final newdt memory location: this ensures we do not accidentally
-    // think this pkg image has the singular unique copy of it
-    void **table = new_dt_objs.table;
-    for (size_t i = 0; i < new_dt_objs.size; i += 2) {
-        void *dt = table[i + 1];
-        if (dt != HT_NOTFOUND) {
-            jl_datatype_t *newdt = (jl_datatype_t*)table[i];
-            jl_typename_t *name = newdt->name;
-            static_assert(offsetof(jl_datatype_t, name) == 0, "");
-            assert(*(void**)dt == (void*)newdt);
-            *newdt = *(jl_datatype_t*)dt; // copy the datatype fields (except field 1, which we corrupt above)
-            newdt->name = name;
-        }
-    }
-    // we should never see these pointers again, so scramble their memory, so any attempt to look at them crashes
-    for (size_t i = 0; i < cleanup_list.len; i++) {
-        void *item = cleanup_list.items[i];
-        jl_taggedvalue_t *o = jl_astaggedvalue(item);
-        jl_value_t *t = jl_typeof(item); // n.b. might be 0xbabababa already
-        if (t == (jl_value_t*)jl_datatype_type)
-            memset(o, 0xba, sizeof(jl_value_t*) + sizeof(jl_datatype_t));
-        else
-            memset(o, 0xba, sizeof(jl_value_t*) + 0); // singleton
-        o->bits.in_image = 1;
-    }
-    arraylist_grow(&cleanup_list, -cleanup_list.len);
-    // finally cache all our new types now
-    jl_safepoint_suspend_all_threads(ct); // past this point, it is now not safe to observe the intermediate states on other threads via reflection, so temporarily pause those
-    for (size_t i = 0; i < new_dt_objs.size; i += 2) {
-        void *dt = table[i + 1];
-        if (dt != HT_NOTFOUND) {
-            jl_datatype_t *newdt = (jl_datatype_t*)table[i];
-            jl_cache_type_(newdt);
-        }
-    }
-    for (size_t i = 0; i < s.fixup_types.len; i++) {
-        uintptr_t item = (uintptr_t)s.fixup_types.items[i];
-        jl_value_t *obj = (jl_value_t*)(image_base + item);
-        assert(jl_is_datatype(obj));
-        jl_cache_type_((jl_datatype_t*)obj);
-    }
-    JL_UNLOCK(&typecache_lock); // Might GC
-    jl_safepoint_resume_all_threads(ct); // TODO: move this later to also protect MethodInstance allocations, but we would need to acquire all jl_specializations_get_linfo and jl_module_globalref locks, which is hard
-    // Perform fixups: things like updating world ages, inserting methods & specializations, etc.
-    for (size_t i = 0; i < s.uniquing_objs.len; i++) {
-        uintptr_t item = (uintptr_t)s.uniquing_objs.items[i];
-        // check whether this is a gvar index
-        int tag = (item & 3);
-        assert(tag == 0 || tag == 2);
-        item &= ~(uintptr_t)3;
-        uintptr_t *pfld;
-        jl_value_t **obj, *newobj;
-        if (tag == 2) {
-            if (image->gvars_base == NULL)
-                continue;
-            item >>= 2;
-            assert(item < s.gvar_record->size / sizeof(reloc_t));
-            pfld = sysimg_gvars(image->gvars_base, image->gvars_offsets, item);
-            obj = *(jl_value_t***)pfld;
-        }
-        else {
-            pfld = (uintptr_t*)(image_base + item);
-            obj = *(jl_value_t***)pfld;
-        }
-        uintptr_t otyp = jl_typetagof(obj);   // the original type of the object that was written here
-        if (otyp == (uintptr_t)jl_method_instance_type) {
-            assert(image_base < (char*)obj && (char*)obj <= image_base + sizeof_sysimg);
-            jl_value_t *m = obj[0];
-            if (jl_is_method_instance(m)) {
-                newobj = m; // already done
-            }
-            else {
-                arraylist_push(&cleanup_list, (void*)obj);
-                jl_value_t *specTypes = obj[1];
-                jl_value_t *sparams = obj[2];
-                newobj = (jl_value_t*)jl_specializations_get_linfo((jl_method_t*)m, specTypes, (jl_svec_t*)sparams);
-                obj[0] = newobj;
-            }
-        }
-        else if (otyp == (uintptr_t)jl_binding_type) {
-            jl_value_t *m = obj[0];
-            if (jl_is_binding(m)) {
-                newobj = m; // already done
-            }
-            else {
-                arraylist_push(&cleanup_list, (void*)obj);
-                jl_value_t *name = obj[1];
-                newobj = (jl_value_t*)jl_get_module_binding((jl_module_t*)m, (jl_sym_t*)name, 1);
-                obj[0] = newobj;
-            }
-        }
-        else {
-            abort(); // should be unreachable
-        }
-        *pfld = (uintptr_t)newobj;
-        assert(!(image_base < (char*)newobj && (char*)newobj <= image_base + sizeof_sysimg));
-        assert(jl_typetagis(obj, otyp));
-    }
-    arraylist_free(&s.uniquing_types);
-    arraylist_free(&s.uniquing_objs);
-    for (size_t i = 0; i < cleanup_list.len; i++) {
-        void *item = cleanup_list.items[i];
-        jl_taggedvalue_t *o = jl_astaggedvalue(item);
-        jl_value_t *t = jl_typeof(item);
-        if (t == (jl_value_t*)jl_method_instance_type)
-            memset(o, 0xba, sizeof(jl_value_t*) * 3); // only specTypes and sparams fields stored
-        else if (t == (jl_value_t*)jl_binding_type)
-            memset(o, 0xba, sizeof(jl_value_t*) * 3); // stored as mod/name
-        o->bits.in_image = 1;
-    }
-    arraylist_free(&cleanup_list);
-    for (size_t i = 0; i < s.fixup_objs.len; i++) {
-        uintptr_t item = (uintptr_t)s.fixup_objs.items[i];
-        jl_value_t *obj = (jl_value_t*)(image_base + item);
-        if (jl_typetagis(obj, jl_typemap_entry_type) || jl_is_method(obj) || jl_is_code_instance(obj)) {
-            jl_array_ptr_1d_push(*internal_methods, obj);
-            assert(s.incremental);
-        }
-        else if (jl_is_method_instance(obj)) {
-            jl_method_instance_t *newobj = jl_specializations_get_or_insert((jl_method_instance_t*)obj);
-            assert(newobj == (jl_method_instance_t*)obj); // strict insertion expected
-            (void)newobj;
-        }
-        else if (jl_is_globalref(obj)) {
-            jl_globalref_t *r = (jl_globalref_t*)obj;
-            if (r->binding == NULL) {
-                jl_globalref_t *gr = (jl_globalref_t*)jl_module_globalref(r->mod, r->name);
-                r->binding = gr->binding;
-                jl_gc_wb(r, gr->binding);
-            }
-        }
-        else if (jl_is_module(obj)) {
-            // rebuild the usings table for module v
-            // TODO: maybe want to hold the lock on `v`, but that only strongly matters for async / thread safety
-            // and we are already bad at that
-            jl_module_t *mod = (jl_module_t*)obj;
-            mod->build_id.hi = checksum;
-            if (mod->usings.items != &mod->usings._space[0]) {
-                // arraylist_t assumes we called malloc to get this memory, so make that true now
-                void **newitems = (void**)malloc_s(mod->usings.max * sizeof(void*));
-                memcpy(newitems, mod->usings.items, mod->usings.len * sizeof(void*));
-                mod->usings.items = newitems;
-            }
-            size_t mod_idx = external_blob_index((jl_value_t*)mod);
-            if (s.incremental) {
-                // Rebuild cross-image usings backedges
-                for (size_t i = 0; i < module_usings_length(mod); ++i) {
-                    struct _jl_module_using *data = module_usings_getidx(mod, i);
-                    if (external_blob_index((jl_value_t*)data->mod) != mod_idx) {
-                        jl_add_usings_backedge(data->mod, mod);
-                    }
-                }
-            }
-        }
-        else {
-            abort();
-        }
-    }
-    if (s.incremental) {
-        int no_replacement = jl_atomic_load_relaxed(&jl_first_image_replacement_world) == ~(size_t)0;
-        for (size_t i = 0; i < s.fixup_objs.len; i++) {
-            uintptr_t item = (uintptr_t)s.fixup_objs.items[i];
-            jl_value_t *obj = (jl_value_t*)(image_base + item);
-            if (jl_is_module(obj)) {
-                jl_module_t *mod = (jl_module_t*)obj;
-                size_t mod_idx = external_blob_index((jl_value_t*)mod);
-                jl_svec_t *table = jl_atomic_load_relaxed(&mod->bindings);
-                int unchanged_implicit = no_replacement || all_usings_unchanged_implicit(mod);
-                for (size_t i = 0; i < jl_svec_len(table); i++) {
-                    jl_binding_t *b = (jl_binding_t*)jl_svecref(table, i);
-                    if ((jl_value_t*)b == jl_nothing)
-                        continue;
-                    jl_binding_partition_t *bpart = jl_atomic_load_relaxed(&b->partitions);
-                    if (!jl_validate_binding_partition(b, bpart, mod_idx, unchanged_implicit, no_replacement)) {
-                        unchanged_implicit = all_usings_unchanged_implicit(mod);
-                    }
-                }
-            }
-        }
-    }
-    arraylist_free(&s.fixup_types);
-    arraylist_free(&s.fixup_objs);
 
-    if (s.incremental)
-        jl_root_new_gvars(&s, image, external_fns_begin);
     ios_close(&relocs);
     ios_close(&const_data);
     ios_close(&gvar_record);
