@@ -502,6 +502,7 @@ typedef struct {
     jl_ptls_t ptls;
     jl_image_t *image;
     int8_t incremental;
+    arraylist_t lazy_relocs;
 } jl_serializer_state;
 
 static jl_value_t *jl_bigint_type = NULL;
@@ -1337,6 +1338,99 @@ static void write_gctaggedfield(jl_serializer_state *s, jl_datatype_t *ref) JL_N
     write_pointer(s->s);
 }
 
+// Special handling from `jl_write_values` for modules
+static void jl_write_module2(jl_serializer_state *s, uintptr_t item, jl_module_t *m) JL_GC_DISABLED
+{
+    size_t reloc_offset = ios_pos(s->s);
+    size_t tot = sizeof(jl_module_t);
+    ios_write(s->s, (char*)m, tot);     // raw memory dump of the `jl_module_t` structure
+    // will need to recreate the binding table for this
+    arraylist_push(&s->fixup_objs, (void*)reloc_offset);
+
+    // Handle the fields requiring special attention
+    jl_module_t *newm = (jl_module_t*)&s->s->buf[reloc_offset];
+    newm->name = NULL;
+    arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, name)));
+    arraylist_push(&s->relocs_list, (void*)backref_id(s, m->name, s->link_ids_relocs));
+    newm->parent = NULL;
+    arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, parent)));
+    arraylist_push(&s->relocs_list, (void*)backref_id(s, m->parent, s->link_ids_relocs));
+    jl_atomic_store_relaxed(&newm->bindings, NULL);
+    arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, bindings)));
+    arraylist_push(&s->relocs_list, (void*)backref_id(s, jl_atomic_load_relaxed(&m->bindings), s->link_ids_relocs));
+    jl_atomic_store_relaxed(&newm->bindingkeyset, NULL);
+    arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, bindingkeyset)));
+    arraylist_push(&s->relocs_list, (void*)backref_id(s, jl_atomic_load_relaxed(&m->bindingkeyset), s->link_ids_relocs));
+    newm->file = NULL;
+    arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, file)));
+    arraylist_push(&s->relocs_list, (void*)backref_id(s, jl_options.strip_metadata ? jl_empty_sym : m->file , s->link_ids_relocs));
+    if (jl_options.strip_metadata)
+        newm->line = 0;
+    newm->usings_backedges = NULL;
+    arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, usings_backedges)));
+    arraylist_push(&s->relocs_list, (void*)backref_id(s, get_replaceable_field(&m->usings_backedges, 1), s->link_ids_relocs));
+    newm->scanned_methods = NULL;
+    arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, scanned_methods)));
+    arraylist_push(&s->relocs_list, (void*)backref_id(s, get_replaceable_field(&m->scanned_methods, 1), s->link_ids_relocs));
+
+    // After reload, everything that has happened in this process happened semantically at
+    // (for .incremental) or before jl_require_world, so reset this flag.
+    jl_atomic_store_relaxed(&newm->export_set_changed_since_require_world, 0);
+
+    // write out the usings list
+    memset(&newm->usings._space, 0, sizeof(newm->usings._space));
+    if (m->usings.items == &m->usings._space[0]) {
+        newm->usings.items = &newm->usings._space[0];
+        // Push these relocations here, to keep them in order. This pairs with the `newm->usings.items = ` below.
+        arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, usings.items)));
+        arraylist_push(&s->relocs_list, (void*)(((uintptr_t)DataRef << RELOC_TAG_OFFSET) + item));
+        size_t i;
+        for (i = 0; i < module_usings_length(m); i++) {
+            struct _jl_module_using *newm_data = module_usings_getidx(newm, i);
+            struct _jl_module_using *data = module_usings_getidx(m, i);
+            // TODO: Remove dead entries
+            newm_data->min_world = data->min_world;
+            newm_data->max_world = data->max_world;
+            if (s->incremental) {
+                if (data->max_world != ~(size_t)0)
+                    newm_data->max_world = 0;
+                newm_data->min_world = jl_require_world;
+            }
+            arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, usings._space[3*i])));
+            arraylist_push(&s->relocs_list, (void*)backref_id(s, data->mod, s->link_ids_relocs));
+        }
+        newm->usings.items = (void**)offsetof(jl_module_t, usings._space);
+    }
+    else {
+        newm->usings.items = (void**)tot;
+        arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, usings.items)));
+        arraylist_push(&s->relocs_list, (void*)(((uintptr_t)DataRef << RELOC_TAG_OFFSET) + item));
+        newm = NULL; // `write_*(s->s)` below may invalidate `newm`, so defensively set it to NULL
+        size_t i;
+        for (i = 0; i < module_usings_length(m); i++) {
+            struct _jl_module_using *data = module_usings_getidx(m, i);
+            write_pointerfield(s, (jl_value_t*)data->mod);
+            if (s->incremental) {
+                // TODO: Drop dead ones entirely?
+                write_uint(s->s, jl_require_world);
+                write_uint(s->s, data->max_world == ~(size_t)0 ? ~(size_t)0 : 1);
+            } else {
+                write_uint(s->s, data->min_world);
+                write_uint(s->s, data->max_world);
+            }
+            static_assert(sizeof(struct _jl_module_using) == 3*sizeof(void*), "_jl_module_using mismatch");
+            tot += sizeof(struct _jl_module_using);
+        }
+        for (; i < module_usings_max(m); i++) {
+            write_pointer(s->s);
+            write_uint(s->s, 0);
+            write_uint(s->s, 0);
+            tot += sizeof(struct _jl_module_using);
+        }
+    }
+    assert(ios_pos(s->s) - reloc_offset == tot);
+}
+
 
 // Special handling from `jl_write_values` for modules
 static void jl_write_module(jl_serializer_state *s, uintptr_t item, jl_module_t *m) JL_GC_DISABLED
@@ -1485,7 +1579,576 @@ static void record_external_fns(jl_serializer_state *s, arraylist_t *external_fn
 #endif
 }
 
+#define RELOC_GC_TAGGED 1
+
+static void write_lazy_reloc(jl_serializer_state *s, void *v, uintptr_t flags)
+{
+    arraylist_push(&s->lazy_relocs, (void*)(uintptr_t)ios_pos(s->s));
+    arraylist_push(&s->lazy_relocs, (void*)backref_id(s, v, NULL));
+    arraylist_push(&s->lazy_relocs, (void*)flags);
+}
+
 jl_value_t *jl_find_ptr = NULL;
+
+// The main function for serializing all the items queued in `serialization_order`
+// (They are also stored in `serialization_queue` which is order-preserving, unlike the hash table used
+//  for `serialization_order`).
+static void jl_write_values2(jl_serializer_state *s) JL_GC_DISABLED
+{
+    size_t l = serialization_queue.len;
+
+    arraylist_new(&layout_table, 0);
+    arraylist_grow(&layout_table, l * 2);
+    memset(layout_table.items, 0, l * 2 * sizeof(void*));
+
+    // Serialize all entries
+    for (size_t item = 0; item < l; item++) {
+        jl_value_t *v = (jl_value_t*)serialization_queue.items[item];           // the object
+        JL_GC_PROMISE_ROOTED(v);
+        assert(!(s->incremental && jl_object_in_image(v)));
+        jl_datatype_t *t = (jl_datatype_t*)jl_typeof(v);
+        assert((!jl_is_datatype_singleton(t) || t->instance == v) && "detected singleton construction corruption");
+        int mutabl = t->name->mutabl;
+        ios_t *f = s->s;
+        if (t->smalltag) {
+            if (t->layout->npointers == 0 || t == jl_string_type) {
+                if (jl_datatype_nfields(t) == 0 || mutabl == 0 || t == jl_string_type) {
+                    f = s->const_data;
+                }
+            }
+        }
+
+        // realign stream to expected gc alignment (16 bytes) after tag
+        uintptr_t skip_header_pos = ios_pos(f) + sizeof(jl_taggedvalue_t);
+        uintptr_t object_id_expected = mutabl &&
+                 t != jl_datatype_type &&
+                 t != jl_typename_type &&
+                 t != jl_string_type &&
+                 t != jl_simplevector_type &&
+                 t != jl_module_type;
+        if (object_id_expected)
+            skip_header_pos += sizeof(size_t);
+        write_padding(f, LLT_ALIGN(skip_header_pos, 16) - skip_header_pos);
+
+        // write header
+        if (object_id_expected)
+            write_uint(f, jl_object_id(v));
+        if (s->incremental && jl_needs_serialization(s, (jl_value_t*)t) && needs_uniquing((jl_value_t*)t, s->query_cache))
+            arraylist_push(&s->uniquing_types, (void*)(uintptr_t)(ios_pos(f)|1));
+        if (f == s->const_data)
+            write_uint(s->const_data, ((uintptr_t)t->smalltag << 4) | GC_OLD_MARKED | GC_IN_IMAGE);
+        else
+            write_gctaggedfield(s, t);
+        size_t reloc_offset = ios_pos(f);
+        assert(item < layout_table.len && layout_table.items[item] == NULL);
+        layout_table.items[item] = (void*)(reloc_offset | (f == s->const_data)); // store the inverse mapping of `serialization_order` (`id` => object-as-streampos)
+
+        assert(!s->incremental);
+        if (s->incremental) {
+            if (needs_uniquing(v, s->query_cache)) {
+                if (jl_is_binding(v)) {
+                    jl_binding_t *b = (jl_binding_t*)v;
+                    write_pointerfield(s, (jl_value_t*)b->globalref->mod);
+                    write_pointerfield(s, (jl_value_t*)b->globalref->name);
+                    continue;
+                }
+                else if (jl_is_method_instance(v)) {
+                    assert(f == s->s);
+                    jl_method_instance_t *mi = (jl_method_instance_t*)v;
+                    write_pointerfield(s, mi->def.value);
+                    write_pointerfield(s, mi->specTypes);
+                    write_pointerfield(s, (jl_value_t*)mi->sparam_vals);
+                    continue;
+                }
+                else if (jl_is_datatype(v)) {
+                    for (size_t i = 0; i < s->uniquing_super.len; i++) {
+                        if (s->uniquing_super.items[i] == (void*)v) {
+                            s->uniquing_super.items[i] = arraylist_pop(&s->uniquing_super);
+                            arraylist_push(&s->uniquing_types, (void*)(uintptr_t)(reloc_offset|3));
+                        }
+                    }
+                }
+                else {
+                    assert(jl_is_datatype_singleton(t) && "unreachable");
+                }
+            }
+            else if (needs_recaching(v, s->query_cache)) {
+                arraylist_push(jl_is_datatype(v) ? &s->fixup_types : &s->fixup_objs, (void*)reloc_offset);
+            }
+        }
+
+        // write data
+        if (jl_is_array(v)) {
+            assert(f == s->s);
+            // Internal data for types in julia.h with `jl_array_t` field(s)
+            jl_array_t *ar = (jl_array_t*)v;
+            // copy header
+            size_t headersize = sizeof(jl_array_t) + jl_array_ndims(ar)*sizeof(size_t);
+            ios_write(f, (char*)v, headersize);
+            // make some header modifications in-place
+            jl_array_t *newa = (jl_array_t*)&f->buf[reloc_offset];
+            newa->ref.mem = NULL; // relocation offset
+            arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_array_t, ref.mem))); // relocation location
+            jl_value_t *mem = get_replaceable_field((jl_value_t**)&ar->ref.mem, 1);
+            arraylist_push(&s->relocs_list, (void*)backref_id(s, mem, s->link_ids_relocs)); // relocation target
+            record_memoryref(s, reloc_offset + offsetof(jl_array_t, ref), ar->ref);
+        }
+        else if (jl_is_genericmemory(v)) {
+            assert(f == s->s);
+            // Internal data for types in julia.h with `jl_genericmemory_t` field(s)
+            jl_genericmemory_t *m = (jl_genericmemory_t*)v;
+            const jl_datatype_layout_t *layout = t->layout;
+            size_t len = m->length;
+            // if (jl_genericmemory_how(m) == 3) {
+            //     jl_value_t *owner = jl_genericmemory_data_owner_field(m);
+            //     write_uint(f, len);
+            //     write_pointerfield(s, owner);
+            //     write_pointerfield(s, owner);
+            //     jl_genericmemory_t *new_mem = (jl_genericmemory_t*)&f->buf[reloc_offset];
+            //     assert(new_mem->ptr == NULL);
+            //     new_mem->ptr = (void*)((char*)m->ptr - (char*)owner); // relocation offset
+            // }
+            // else
+            {
+                size_t datasize = len * layout->size;
+                size_t tot = datasize;
+                int isbitsunion = layout->flags.arrayelem_isunion;
+                if (isbitsunion)
+                    tot += len;
+                size_t headersize = sizeof(jl_genericmemory_t);
+                // copy header
+                ios_write(f, (char*)v, headersize);
+                // write data
+                if (!layout->flags.arrayelem_isboxed && layout->first_ptr < 0) {
+                    // set owner to NULL
+                    write_pointer(f);
+                    // Non-pointer eltypes get encoded in the const_data section
+                    size_t alignment_amt = JL_SMALL_BYTE_ALIGNMENT;
+                    if (tot >= ARRAY_CACHE_ALIGN_THRESHOLD)
+                        alignment_amt = JL_CACHE_BYTE_ALIGNMENT;
+                    uintptr_t data = LLT_ALIGN(ios_pos(s->const_data), alignment_amt);
+                    write_padding(s->const_data, data - ios_pos(s->const_data));
+                    // write data and relocations
+                    jl_genericmemory_t *new_mem = (jl_genericmemory_t*)&f->buf[reloc_offset];
+                    new_mem->ptr = NULL; // relocation offset
+                    data /= sizeof(void*);
+                    assert(data < ((uintptr_t)1 << RELOC_TAG_OFFSET) && "offset to constant data too large");
+                    arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_genericmemory_t, ptr))); // relocation location
+                    arraylist_push(&s->relocs_list, (void*)(((uintptr_t)ConstDataRef << RELOC_TAG_OFFSET) + data)); // relocation target
+                    jl_value_t *et = jl_tparam1(t);
+                    if (jl_is_cpointer_type(et)) {
+                        // reset Ptr fields to C_NULL (but keep MAP_FAILED / INVALID_HANDLE)
+                        const intptr_t *data = (const intptr_t*)m->ptr;
+                        size_t i;
+                        for (i = 0; i < len; i++) {
+                            if (data[i] != -1)
+                                write_pointer(s->const_data);
+                            else
+                                ios_write(s->const_data, (char*)&data[i], sizeof(data[i]));
+                        }
+                    }
+                    else {
+                        if (isbitsunion) {
+                            ios_write(s->const_data, (char*)m->ptr, datasize);
+                            ios_write(s->const_data, jl_genericmemory_typetagdata(m), len);
+                        }
+                        else {
+                            ios_write(s->const_data, (char*)m->ptr, tot);
+                        }
+                    }
+                    if (len == 0) { // TODO: should we have a zero-page, instead of writing each type's fragment separately?
+                        write_padding(s->const_data, layout->size ? layout->size : isbitsunion);
+                    }
+                    else if (jl_genericmemory_how(m) == 3) {
+                        assert(jl_is_string(jl_genericmemory_data_owner_field(m)));
+                        write_padding(s->const_data, 1);
+                    }
+                }
+                else {
+                    // Pointer eltypes are encoded in the mutable data section
+                    headersize = LLT_ALIGN(headersize, JL_SMALL_BYTE_ALIGNMENT);
+                    size_t data = LLT_ALIGN(ios_pos(f), JL_SMALL_BYTE_ALIGNMENT);
+                    write_padding(f, data - ios_pos(f));
+                    assert(reloc_offset + headersize == ios_pos(f));
+                    jl_genericmemory_t *new_mem = (jl_genericmemory_t*)&f->buf[reloc_offset];
+                    new_mem->ptr = (void*)headersize; // relocation offset
+                    arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_genericmemory_t, ptr))); // relocation location
+                    arraylist_push(&s->relocs_list, (void*)(((uintptr_t)DataRef << RELOC_TAG_OFFSET) + item)); // relocation target
+                    if (!layout->flags.arrayelem_isboxed) {
+                        // copy all of the data first
+                        const char *data = (const char*)m->ptr;
+                        ios_write(f, data, datasize);
+                        // the rewrite all of the embedded pointers to null+relocation
+                        uint16_t elsz = layout->size;
+                        size_t j, np = layout->first_ptr < 0 ? 0 : layout->npointers;
+                        size_t i;
+                        for (i = 0; i < len; i++) {
+                            for (j = 0; j < np; j++) {
+                                size_t offset = i * elsz + jl_ptr_offset(t, j) * sizeof(jl_value_t*);
+                                jl_value_t *fld = get_replaceable_field((jl_value_t**)&data[offset], 1);
+                                size_t fld_pos = reloc_offset + headersize + offset;
+                                if (fld != NULL) {
+                                    arraylist_push(&s->relocs_list, (void*)(uintptr_t)fld_pos); // relocation location
+                                    arraylist_push(&s->relocs_list, (void*)backref_id(s, fld, s->link_ids_relocs)); // relocation target
+                                    record_uniquing(s, fld, fld_pos);
+                                }
+                                memset(&f->buf[fld_pos], 0, sizeof(fld)); // relocation offset (none)
+                            }
+                        }
+                    }
+                    else {
+                        jl_value_t **data = (jl_value_t**)m->ptr;
+                        size_t i;
+                        for (i = 0; i < len; i++) {
+                            jl_value_t *e = get_replaceable_field(&data[i], 1);
+                            write_pointerfield(s, e);
+                        }
+                    }
+                }
+            }
+        }
+        else if (jl_typeis(v, jl_module_type)) {
+            assert(f == s->s);
+            jl_write_module2(s, item, (jl_module_t*)v);
+        }
+        else if (jl_typetagis(v, jl_task_tag << 4)) {
+            abort(); // unreachable
+        }
+        else if (jl_is_svec(v)) {
+            assert(f == s->s);
+            ios_write(f, (char*)v, sizeof(void*));
+            size_t ii, l = jl_svec_len(v);
+            assert(l > 0 || (jl_svec_t*)v == jl_emptysvec);
+            for (ii = 0; ii < l; ii++) {
+                write_pointerfield(s, jl_svecref(v, ii));
+            }
+        }
+        else if (jl_is_string(v)) {
+            ios_write(f, (char*)v, sizeof(void*) + jl_string_len(v));
+            write_uint8(f, '\0'); // null-terminated strings for easier C-compatibility
+        }
+        else if (jl_is_foreign_type(t) == 1) {
+            abort(); // unreachable
+        }
+        else if (jl_datatype_nfields(t) == 0) {
+            // The object has no fields, so we just snapshot its byte representation
+            assert(t->layout->npointers == 0);
+            ios_write(f, (char*)v, jl_datatype_size(t));
+        }
+        else if (jl_bigint_type && jl_typetagis(v, jl_bigint_type)) {
+            // foreign types require special handling
+            assert(f == s->s);
+            jl_value_t *sizefield = jl_get_nth_field(v, 1);
+            int32_t sz = jl_unbox_int32(sizefield);
+            int32_t nw = (sz == 0 ? 1 : (sz < 0 ? -sz : sz));
+            size_t nb = nw * gmp_limb_size;
+            ios_write(f, (char*)&nw, sizeof(int32_t));
+            ios_write(f, (char*)&sz, sizeof(int32_t));
+            uintptr_t data = LLT_ALIGN(ios_pos(s->const_data), 8);
+            write_padding(s->const_data, data - ios_pos(s->const_data));
+            data /= sizeof(void*);
+            assert(data < ((uintptr_t)1 << RELOC_TAG_OFFSET) && "offset to constant data too large");
+            arraylist_push(&s->relocs_list, (void*)(reloc_offset + 8)); // relocation location
+            arraylist_push(&s->relocs_list, (void*)(((uintptr_t)ConstDataRef << RELOC_TAG_OFFSET) + data)); // relocation target
+            void *pdata = jl_unbox_voidpointer(jl_get_nth_field(v, 2));
+            ios_write(s->const_data, (char*)pdata, nb);
+            write_pointer(f);
+        }
+        else {
+            // Generic object::DataType serialization by field
+            const char *data = (const char*)v;
+            size_t i, nf = jl_datatype_nfields(t);
+            size_t tot = 0;
+            for (i = 0; i < nf; i++) {
+                size_t offset = jl_field_offset(t, i);
+                const char *slot = data + offset;
+                write_padding(f, offset - tot);
+                tot = offset;
+                size_t fsz = jl_field_size(t, i);
+                jl_value_t *replace = (jl_value_t*)ptrhash_get(&bits_replace, (void*)slot);
+                if (replace != HT_NOTFOUND && fsz > 0) {
+                    assert(t->name->mutabl && !jl_field_isptr(t, i));
+                    jl_value_t *rty = jl_typeof(replace);
+                    size_t sz = jl_datatype_size(rty);
+                    ios_write(f, (const char*)replace, sz);
+                    jl_value_t *ft = jl_field_type_concrete(t, i);
+                    int isunion = jl_is_uniontype(ft);
+                    unsigned nth = 0;
+                    if (!jl_find_union_component(ft, rty, &nth))
+                        assert(0 && "invalid field assignment to isbits union");
+                    assert(sz <= fsz - isunion);
+                    write_padding(f, fsz - sz - isunion);
+                    if (isunion)
+                        write_uint8(f, nth);
+                }
+                else if (t->name->mutabl && jl_is_cpointer_type(jl_field_type_concrete(t, i)) && *(intptr_t*)slot != -1) {
+                    // reset Ptr fields to C_NULL (but keep MAP_FAILED / INVALID_HANDLE)
+                    assert(!jl_field_isptr(t, i));
+                    write_pointer(f);
+                }
+                else if (fsz > 0) {
+                    ios_write(f, slot, fsz);
+                }
+                tot += fsz;
+            }
+
+            size_t np = t->layout->npointers;
+            size_t fldidx = 1;
+            for (i = 0; i < np; i++) {
+                size_t offset = jl_ptr_offset(t, i) * sizeof(jl_value_t*);
+                while (offset >= (fldidx == nf ? jl_datatype_size(t) : jl_field_offset(t, fldidx)))
+                    fldidx++;
+                int mutabl = !jl_field_isconst(t, fldidx - 1);
+                jl_value_t *fld = get_replaceable_field((jl_value_t**)&data[offset], mutabl);
+                size_t fld_pos = offset + reloc_offset;
+                if (fld != NULL) {
+                    arraylist_push(&s->relocs_list, (void*)(uintptr_t)(fld_pos)); // relocation location
+                    arraylist_push(&s->relocs_list, (void*)backref_id(s, fld, s->link_ids_relocs)); // relocation target
+                    record_uniquing(s, fld, fld_pos);
+                }
+                memset(&f->buf[fld_pos], 0, sizeof(fld)); // relocation offset (none)
+            }
+
+            // Need do a tricky fieldtype walk an record all memoryref we find inlined in this value
+            record_memoryrefs_inside(s, t, reloc_offset, data);
+
+            // A few objects need additional handling beyond the generic serialization above
+            if (s->incremental && jl_typetagis(v, jl_typemap_entry_type)) {
+                assert(f == s->s);
+                jl_typemap_entry_t *newentry = (jl_typemap_entry_t*)&s->s->buf[reloc_offset];
+                if (jl_atomic_load_relaxed(&newentry->max_world) == ~(size_t)0) {
+                    if (jl_atomic_load_relaxed(&newentry->min_world) > 1) {
+                        jl_atomic_store_relaxed(&newentry->min_world, ~(size_t)0);
+                        jl_atomic_store_relaxed(&newentry->max_world, WORLD_AGE_REVALIDATION_SENTINEL);
+                        arraylist_push(&s->fixup_objs, (void*)reloc_offset);
+                    }
+                }
+                else {
+                    // garbage newentry - delete it :(
+                    jl_atomic_store_relaxed(&newentry->min_world, 1);
+                    jl_atomic_store_relaxed(&newentry->max_world, 0);
+                }
+            }
+            else if (s->incremental && jl_is_binding_partition(v)) {
+                jl_binding_partition_t *newbpart = (jl_binding_partition_t*)&s->s->buf[reloc_offset];
+                size_t max_world = jl_atomic_load_relaxed(&newbpart->max_world);
+                if (max_world == ~(size_t)0) {
+                    // Still valid. Will be considered to be defined in jl_require_world
+                    // after reload, which is the first world before new code runs.
+                    // We use this as a quick check to determine whether a binding was
+                    // invalidated. If a binding was first defined in or before
+                    // jl_require_world, then we can assume that all precompile processes
+                    // will have seen it consistently.
+                    jl_atomic_store_relaxed(&newbpart->min_world, jl_require_world);
+                }
+                else {
+                    // The world will not be reachable after loading
+                    jl_atomic_store_relaxed(&newbpart->min_world, 1);
+                    jl_atomic_store_relaxed(&newbpart->max_world, 0);
+                }
+            }
+            else if (jl_is_method(v)) {
+                assert(f == s->s);
+                write_padding(f, sizeof(jl_method_t) - tot); // hidden fields
+                jl_method_t *m = (jl_method_t*)v;
+                jl_method_t *newm = (jl_method_t*)&f->buf[reloc_offset];
+                if (s->incremental) {
+                    if (jl_atomic_load_relaxed(&newm->primary_world) > 1) {
+                        jl_atomic_store_relaxed(&newm->primary_world, ~(size_t)0); // min-world
+                        int dispatch_status = jl_atomic_load_relaxed(&newm->dispatch_status);
+                        int new_dispatch_status = 0;
+                        if (!(dispatch_status & METHOD_SIG_LATEST_ONLY))
+                            new_dispatch_status |= METHOD_SIG_PRECOMPILE_MANY;
+                        jl_atomic_store_relaxed(&newm->dispatch_status, new_dispatch_status);
+                        arraylist_push(&s->fixup_objs, (void*)reloc_offset);
+                    }
+                }
+                else {
+                    newm->nroots_sysimg = m->roots ? jl_array_len(m->roots) : 0;
+                }
+            }
+            else if (jl_is_method_instance(v)) {
+                assert(f == s->s);
+                jl_method_instance_t *newmi = (jl_method_instance_t*)&f->buf[reloc_offset];
+                jl_atomic_store_relaxed(&newmi->flags, 0);
+                if (s->incremental) {
+                    jl_atomic_store_relaxed(&newmi->dispatch_status, 0);
+                }
+            }
+            else if (jl_is_code_instance(v)) {
+                assert(f == s->s);
+
+                // Handle the native-code pointers
+                jl_code_instance_t *ci = (jl_code_instance_t*)v;
+                jl_code_instance_t *newci = (jl_code_instance_t*)&f->buf[reloc_offset];
+
+                if (s->incremental) {
+                    if (jl_atomic_load_relaxed(&ci->max_world) == ~(size_t)0) {
+                        if (jl_atomic_load_relaxed(&newci->min_world) > 1) {
+                            //assert(jl_atomic_load_relaxed(&ci->edges) != jl_emptysvec); // some code (such as !==) might add a method lookup restriction but not keep the edges
+                            jl_atomic_store_release(&newci->min_world, ~(size_t)0);
+                            jl_atomic_store_release(&newci->max_world, WORLD_AGE_REVALIDATION_SENTINEL);
+                            arraylist_push(&s->fixup_objs, (void*)reloc_offset);
+                        }
+                    }
+                    else {
+                        // garbage object - delete it :(
+                        jl_atomic_store_release(&newci->min_world, 1);
+                        jl_atomic_store_release(&newci->max_world, 0);
+                    }
+                }
+                jl_atomic_store_relaxed(&newci->time_compile, 0.0);
+                jl_atomic_store_relaxed(&newci->invoke, NULL);
+                jl_atomic_store_relaxed(&newci->specsigflags, 0);
+                jl_atomic_store_relaxed(&newci->specptr.fptr, NULL);
+                int8_t fptr_id = JL_API_NULL;
+                int8_t builtin_id = 0;
+                if (jl_atomic_load_relaxed(&ci->invoke) == jl_fptr_const_return) {
+                    fptr_id = JL_API_CONST;
+                }
+                else {
+                    if (jl_is_method(jl_get_ci_mi(ci)->def.method)) {
+                        builtin_id = jl_fptr_id(jl_atomic_load_relaxed(&ci->specptr.fptr));
+                        if (builtin_id) { // found in the table of builtins
+                            assert(builtin_id >= 2);
+                            fptr_id = JL_API_BUILTIN;
+                        }
+                        else {
+                            int32_t invokeptr_id = 0;
+                            int32_t specfptr_id = 0;
+                            jl_get_function_id(native_functions, ci, &invokeptr_id, &specfptr_id); // see if we generated code for it
+                            if (invokeptr_id) {
+                                if (invokeptr_id == -1) {
+                                    fptr_id = JL_API_BOXED;
+                                }
+                                else if (invokeptr_id == -2) {
+                                    fptr_id = JL_API_WITH_PARAMETERS;
+                                }
+                                else if (invokeptr_id == -3) {
+                                    abort();
+                                }
+                                else if (invokeptr_id == -4) {
+                                    fptr_id = JL_API_OC_CALL;
+                                }
+                                else if (invokeptr_id == -5) {
+                                    abort();
+                                }
+                                else {
+                                    assert(invokeptr_id > 0);
+                                    ios_ensureroom(s->fptr_record, invokeptr_id * sizeof(void*));
+                                    ios_seek(s->fptr_record, (invokeptr_id - 1) * sizeof(void*));
+                                    write_reloc_t(s->fptr_record, (reloc_t)~reloc_offset);
+#ifdef _P64
+                                    if (sizeof(reloc_t) < 8)
+                                        write_padding(s->fptr_record, 8 - sizeof(reloc_t));
+#endif
+                                }
+                                if (specfptr_id) {
+                                    assert(specfptr_id > invokeptr_id && specfptr_id > 0);
+                                    ios_ensureroom(s->fptr_record, specfptr_id * sizeof(void*));
+                                    ios_seek(s->fptr_record, (specfptr_id - 1) * sizeof(void*));
+                                    write_reloc_t(s->fptr_record, reloc_offset);
+#ifdef _P64
+                                    if (sizeof(reloc_t) < 8)
+                                        write_padding(s->fptr_record, 8 - sizeof(reloc_t));
+#endif
+                                }
+                            }
+                        }
+                    }
+                }
+                jl_atomic_store_relaxed(&newci->invoke, NULL); // relocation offset
+                if (fptr_id != JL_API_NULL) {
+                    assert(fptr_id < BuiltinFunctionTag && "too many functions to serialize");
+                    arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_code_instance_t, invoke))); // relocation location
+                    arraylist_push(&s->relocs_list, (void*)(((uintptr_t)FunctionRef << RELOC_TAG_OFFSET) + fptr_id)); // relocation target
+                }
+                if (builtin_id >= 2) {
+                    arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_code_instance_t, specptr.fptr))); // relocation location
+                    arraylist_push(&s->relocs_list, (void*)(((uintptr_t)FunctionRef << RELOC_TAG_OFFSET) + BuiltinFunctionTag + builtin_id - 2)); // relocation target
+                }
+            }
+            else if (jl_is_datatype(v)) {
+                assert(f == s->s);
+                jl_datatype_t *dt = (jl_datatype_t*)v;
+                jl_datatype_t *newdt = (jl_datatype_t*)&f->buf[reloc_offset];
+
+                if (dt->layout != NULL) {
+                    size_t nf = dt->layout->nfields;
+                    size_t np = dt->layout->npointers;
+                    size_t fieldsize = 0;
+                    uint8_t is_foreign_type = dt->layout->flags.fielddesc_type == 3;
+                    if (!is_foreign_type) {
+                        fieldsize = jl_fielddesc_size(dt->layout->flags.fielddesc_type);
+                    }
+                    char *flddesc = (char*)dt->layout;
+                    size_t fldsize = sizeof(jl_datatype_layout_t) + nf * fieldsize;
+                    if (!is_foreign_type && dt->layout->first_ptr != -1)
+                        fldsize += np << dt->layout->flags.fielddesc_type;
+                    uintptr_t layout = LLT_ALIGN(ios_pos(s->const_data), sizeof(void*));
+                    write_padding(s->const_data, layout - ios_pos(s->const_data)); // realign stream
+                    newdt->layout = NULL; // relocation offset
+                    layout /= sizeof(void*);
+                    arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_datatype_t, layout))); // relocation location
+                    arraylist_push(&s->relocs_list, (void*)(((uintptr_t)ConstDataRef << RELOC_TAG_OFFSET) + layout)); // relocation target
+                    ios_write(s->const_data, flddesc, fldsize);
+                    if (is_foreign_type) {
+                        // make sure we have space for the extra hidden pointers
+                        // zero them since they will need to be re-initialized externally
+                        assert(fldsize == sizeof(jl_datatype_layout_t));
+                        jl_fielddescdyn_t dyn = {0, 0};
+                        ios_write(s->const_data, (char*)&dyn, sizeof(jl_fielddescdyn_t));
+                    }
+                }
+                void *superidx = ptrhash_get(&serialization_order, dt->super);
+                if (s->incremental && superidx != HT_NOTFOUND && from_seroder_entry(superidx) > item && needs_uniquing((jl_value_t*)dt->super, s->query_cache))
+                    arraylist_push(&s->uniquing_super, dt->super);
+            }
+            else if (jl_is_typename(v)) {
+                assert(f == s->s);
+                jl_typename_t *tn = (jl_typename_t*)v;
+                jl_typename_t *newtn = (jl_typename_t*)&f->buf[reloc_offset];
+                if (tn->atomicfields != NULL) {
+                    size_t nb = (jl_svec_len(tn->names) + 31) / 32 * sizeof(uint32_t);
+                    uintptr_t layout = LLT_ALIGN(ios_pos(s->const_data), sizeof(void*));
+                    write_padding(s->const_data, layout - ios_pos(s->const_data)); // realign stream
+                    newtn->atomicfields = NULL; // relocation offset
+                    layout /= sizeof(void*);
+                    arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_typename_t, atomicfields))); // relocation location
+                    arraylist_push(&s->relocs_list, (void*)(((uintptr_t)ConstDataRef << RELOC_TAG_OFFSET) + layout)); // relocation target
+                    ios_write(s->const_data, (char*)tn->atomicfields, nb);
+                }
+                if (tn->constfields != NULL) {
+                    size_t nb = (jl_svec_len(tn->names) + 31) / 32 * sizeof(uint32_t);
+                    uintptr_t layout = LLT_ALIGN(ios_pos(s->const_data), sizeof(void*));
+                    write_padding(s->const_data, layout - ios_pos(s->const_data)); // realign stream
+                    newtn->constfields = NULL; // relocation offset
+                    layout /= sizeof(void*);
+                    arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_typename_t, constfields))); // relocation location
+                    arraylist_push(&s->relocs_list, (void*)(((uintptr_t)ConstDataRef << RELOC_TAG_OFFSET) + layout)); // relocation target
+                    ios_write(s->const_data, (char*)tn->constfields, nb);
+                }
+            }
+            else if (jl_is_globalref(v)) {
+                assert(f == s->s);
+                jl_globalref_t *gr = (jl_globalref_t*)v;
+                if (s->incremental && jl_object_in_image((jl_value_t*)gr->mod)) {
+                    // will need to populate the binding field later
+                    arraylist_push(&s->fixup_objs, (void*)reloc_offset);
+                }
+            }
+            else if (jl_is_genericmemoryref(v)) {
+                assert(f == s->s);
+                record_memoryref(s, reloc_offset, *(jl_genericmemoryref_t*)v);
+            }
+            else {
+                write_padding(f, jl_datatype_size(t) - tot);
+            }
+        }
+    }
+    assert(s->uniquing_super.len == 0);
+}
+
 // The main function for serializing all the items queued in `serialization_order`
 // (They are also stored in `serialization_queue` which is order-preserving, unlike the hash table used
 //  for `serialization_order`).
@@ -3359,6 +4022,7 @@ static void jl_save_system_image2_to_stream(ios_t *f, jl_array_t *mod_array,
     jl_write_offsetlist(s.relocs, sysimg_size, &s.relocs_list);
     // jl_write_offsetlist(s.relocs, sysimg_size, &s.memowner_list);
     jl_write_offsetlist(s.relocs, sysimg_size, &s.memref_list);
+    assert(!s.incremental);
     if (s.incremental) {
         jl_write_arraylist(s.relocs, &s.uniquing_types);
         jl_write_arraylist(s.relocs, &s.uniquing_objs);
