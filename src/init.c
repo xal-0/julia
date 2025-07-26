@@ -619,7 +619,8 @@ static NOINLINE void _finish_jl_init_(jl_image_buf_t sysimage, jl_ptls_t ptls, j
     jl_start_gc_threads();
     uv_barrier_wait(&thread_init_done);
 
-    jl_gc_enable(1);
+    if (!getenv("JULIA_DISABLE_GC"))
+        jl_gc_enable(1);
 
     if ((sysimage.kind != JL_IMAGE_KIND_NONE) &&
             (!jl_generating_output() || jl_options.incremental) && jl_module_init_order) {
