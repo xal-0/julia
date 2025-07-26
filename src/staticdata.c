@@ -4979,17 +4979,8 @@ static void jl_restore_system_image2_from_stream_(
         jl_typeinf_world = read_uint(f);
         jl_set_gs_ctr(gs_ctr);
     }
-    s.buildid_depmods_idxs = depmod_to_imageidx(depmods);
-    if (s.incremental) {
-        assert(restored && init_order && extext_methods && internal_methods && new_ext_cis && method_roots_list && edges);
-        *restored = (jl_array_t*)jl_delayed_reloc(&s, offset_restored);
-        *init_order = (jl_array_t*)jl_delayed_reloc(&s, offset_init_order);
-        *extext_methods = (jl_array_t*)jl_delayed_reloc(&s, offset_extext_methods);
-        *new_ext_cis = (jl_array_t*)jl_delayed_reloc(&s, offset_new_ext_cis);
-        *method_roots_list = (jl_array_t*)jl_delayed_reloc(&s, offset_method_roots_list);
-        *edges = (jl_array_t*)jl_delayed_reloc(&s, offset_edges);
-        *internal_methods = jl_alloc_vec_any(0);
-    }
+    assert(!depmods);
+    s.buildid_depmods_idxs = NULL /* depmod_to_imageidx(depmods) */;
     s.s = NULL;
 
     // step 3: apply relocations
@@ -5010,11 +5001,6 @@ static void jl_restore_system_image2_from_stream_(
     // s.link_ids_gvars will be processed in `jl_update_all_gvars`
     // s.link_ids_external_fns will be processed in `jl_update_all_gvars`
     jl_update_all_gvars(&s, image, 0xffffffff); // gvars relocs
-    {
-        arraylist_new(&s.uniquing_types, 0);
-        arraylist_new(&s.uniquing_objs, 0);
-        arraylist_new(&s.fixup_types, 0);
-    }
     jl_read_arraylist(s.relocs, &s.fixup_objs);
     // Perform the uniquing of objects that we don't "own" and consequently can't promise
     // weren't created by some other package before this one got loaded:
