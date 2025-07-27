@@ -467,7 +467,6 @@ void *native_functions;   // opaque jl_native_code_desc_t blob used for fetching
 static htable_t field_replace;
 static htable_t bits_replace;
 
-
 typedef struct {
     ios_t *s;                   // the main stream
     ios_t *const_data;          // GC-invisible internal data (e.g., datatype layouts, list-like typename fields, foreign types, internal arrays)
@@ -475,10 +474,11 @@ typedef struct {
     ios_t *relocs;              // for (de)serializing relocs_list and gctags_list
     ios_t *gvar_record;         // serialized array mapping gvid => spos
     ios_t *fptr_record;         // serialized array mapping fptrid => spos
-    arraylist_t memowner_list;  // a list of memory locations that have shared owners
+    arraylist_t memowner_list;  // a list of memory locations that have shared owners (unused?)
     arraylist_t memref_list;    // a list of memoryref locations
     arraylist_t relocs_list;    // a list of (location, target) pairs, see description at top
     arraylist_t gctags_list;    //      "
+    //  \/ unnecessary for system images
     arraylist_t uniquing_types; // a list of locations that reference types that must be de-duplicated
     arraylist_t uniquing_super; // a list of datatypes, used in super fields, that need to be marked in uniquing_types once they are reached, for handling unique-ing of them on deserialization
     arraylist_t uniquing_objs;  // a list of locations that reference non-types that must be de-duplicated
@@ -491,6 +491,7 @@ typedef struct {
     //     i = findfirst(==(link_ids[j]), build_ids)
     //     blob_base = jl_linkage_blobs.items[2i]                     # 0-offset indexing
     // We need separate lists since they are intermingled at creation but split when written.
+    // \/ unnecessary for system images
     jl_array_t *link_ids_relocs;
     jl_array_t *link_ids_gctags;
     jl_array_t *link_ids_gvars;
@@ -502,7 +503,6 @@ typedef struct {
     jl_ptls_t ptls;
     jl_image_t *image;
     int8_t incremental;
-    arraylist_t lazy_relocs;
 } jl_serializer_state;
 
 static jl_value_t *jl_bigint_type = NULL;
@@ -3697,6 +3697,29 @@ static void jl_prepare_serialization_data(jl_array_t *mod_array, jl_array_t *new
     JL_GC_POP();
 }
 
+static int compare_ptr(const void *p, const void *q)
+{
+    return ((uintptr_t)p) - ((uintptr_t)q);
+}
+
+static void write_reloc_table(jl_serializer_state *s)
+{
+    arraylist_t table;
+    arraylist_new(&table, (s->relocs_list.len + s->gctags_list.len + s->memref_list.len) / 2);
+
+    int j = 0;
+    for (int i = 0; i < s->relocs_list.len; i += 2)
+        table.items[j++] = s->relocs_list.items[i];
+    for (int i = 0; i < s->gctags_list.len; i += 2)
+        table.items[j++] = (void *)((uintptr_t) s->gctags_list.items[i] | 1);
+    for (int i = 0; i < s->memref_list.len; i += 2)
+        table.items[j++] = (void *)((uintptr_t) s->memref_list.items[i] | 2);
+    qsort(table.items, j, sizeof(void *), compare_ptr);
+    write_uint32(s->relocs, j);
+    ios_write(s->relocs, (const char *)table.items, j * sizeof(void *));
+    arraylist_free(&table);
+}
+
 static void jl_save_system_image2_to_stream(ios_t *f, jl_array_t *mod_array,
                                            jl_array_t *worklist, jl_array_t *extext_methods,
                                            jl_array_t *new_ext_cis, jl_array_t *edges,
@@ -4009,16 +4032,11 @@ static void jl_save_system_image2_to_stream(ios_t *f, jl_array_t *mod_array,
     char *base = &f->buf[0];
     jl_finish_relocs(base + sysimg_offset, sysimg_size, &s.gctags_list);
     jl_finish_relocs(base + sysimg_offset, sysimg_size, &s.relocs_list);
+    write_reloc_table(&s);
     jl_write_offsetlist(s.relocs, sysimg_size, &s.gctags_list);
     jl_write_offsetlist(s.relocs, sysimg_size, &s.relocs_list);
-    // jl_write_offsetlist(s.relocs, sysimg_size, &s.memowner_list);
     jl_write_offsetlist(s.relocs, sysimg_size, &s.memref_list);
     assert(!s.incremental);
-    if (s.incremental) {
-        jl_write_arraylist(s.relocs, &s.uniquing_types);
-        jl_write_arraylist(s.relocs, &s.uniquing_objs);
-        jl_write_arraylist(s.relocs, &s.fixup_types);
-    }
     jl_write_arraylist(s.relocs, &s.fixup_objs);
     write_uint(f, relocs.size);
     write_padding(f, LLT_ALIGN(ios_pos(f), 8) - ios_pos(f));
@@ -4873,6 +4891,19 @@ static int all_usings_unchanged_implicit(jl_module_t *mod)
     return unchanged_implicit;
 }
 
+int reloc_table_len;
+uintptr_t *reloc_table;
+static void read_reloc_table(jl_serializer_state *s)
+{
+    int num = read_uint32(s->relocs);
+    reloc_table_len = num;
+    reloc_table = malloc(num * sizeof(void *));
+    ios_read(s->relocs, (char *)reloc_table, num * sizeof(void *));
+    // for (int i = 0; i < num; i++) {
+
+    // }
+}
+
 static void jl_restore_system_image2_from_stream_(
     ios_t *f, jl_image_t *image, jl_array_t *depmods, uint64_t checksum,
     /* outputs */ jl_array_t **restored, jl_array_t **init_order,
@@ -4992,11 +5023,10 @@ static void jl_restore_system_image2_from_stream_(
     reloc_t *relocs_base = (reloc_t*)&relocs.buf[0];
 
     s.s = &sysimg;
+    read_reloc_table(&s);
     jl_read_reloclist(&s, s.link_ids_gctags, GC_OLD | GC_IN_IMAGE); // gctags
-    size_t sizeof_tags = ios_pos(&relocs);
-    (void)sizeof_tags;
+    size_t sizeof_tags = 0;
     jl_read_reloclist(&s, s.link_ids_relocs, 0); // general relocs
-    // jl_read_memreflist(&s); // memowner_list relocs (must come before memref_list reads the pointers and after general relocs computes the pointers)
     jl_read_memreflist(&s); // memref_list relocs
     // s.link_ids_gvars will be processed in `jl_update_all_gvars`
     // s.link_ids_external_fns will be processed in `jl_update_all_gvars`
