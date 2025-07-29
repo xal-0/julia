@@ -233,6 +233,7 @@ static int is_addr_on_stack(jl_task_t *ct, void *addr) JL_NOTSAFEPOINT
 
 static void sigdie_handler(int sig, siginfo_t *info, void *context)
 {
+    __builtin_trap();
     signal(sig, SIG_DFL);
     uv_tty_reset_mode();
     if (sig == SIGILL)
@@ -303,7 +304,7 @@ int exc_reg_is_write_fault(uintptr_t esr) {
 }
 #endif
 
-#if defined(HAVE_MACH)
+#if 0 && defined(HAVE_MACH)
 #include "signals-mach.c"
 #else
 #include <poll.h>
@@ -396,6 +397,10 @@ static int jl_is_on_sigstack(jl_ptls_t ptls, void *ptr, void *context) JL_NOTSAF
             is_addr_on_sigstack(ptls, (void*)jl_get_rsp_from_ctx(context)));
 }
 
+extern char *jl_sysimg_start;
+extern size_t jl_sysimg_size;
+void jl_relocate_page(void *addr);
+
 JL_NO_ASAN static void segv_handler(int sig, siginfo_t *info, void *context)
 {
     assert(sig == SIGSEGV || sig == SIGBUS);
@@ -407,6 +412,12 @@ JL_NO_ASAN static void segv_handler(int sig, siginfo_t *info, void *context)
     jl_task_t *ct = jl_get_current_task();
     if (ct == NULL || ct->ptls == NULL || jl_atomic_load_relaxed(&ct->ptls->gc_state) == JL_GC_STATE_WAITING) {
         sigdie_handler(sig, info, context);
+        return;
+    }
+    if (sig == SIGSEGV && info->si_code == SEGV_ACCERR &&
+        info->si_addr >= jl_sysimg_start &&
+        info->si_addr < (jl_sysimg_start + jl_sysimg_size)) {
+        jl_relocate_page(info->si_addr);
         return;
     }
     if (sig == SIGSEGV && info->si_code == SEGV_ACCERR && jl_addr_is_safepoint((uintptr_t)info->si_addr) && !is_write_fault(context)) {
