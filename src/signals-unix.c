@@ -400,6 +400,7 @@ static int jl_is_on_sigstack(jl_ptls_t ptls, void *ptr, void *context) JL_NOTSAF
 extern char *jl_sysimg_start;
 extern size_t jl_sysimg_size;
 void jl_relocate_page(void *addr);
+int jl_using_new_image;
 
 JL_NO_ASAN static void segv_handler(int sig, siginfo_t *info, void *context)
 {
@@ -414,7 +415,8 @@ JL_NO_ASAN static void segv_handler(int sig, siginfo_t *info, void *context)
         sigdie_handler(sig, info, context);
         return;
     }
-    if (sig == SIGSEGV && info->si_code == SEGV_ACCERR &&
+    if (jl_using_new_image &&
+        sig == SIGSEGV && info->si_code == SEGV_ACCERR &&
         info->si_addr >= jl_sysimg_start &&
         info->si_addr < (jl_sysimg_start + jl_sysimg_size)) {
         jl_relocate_page(info->si_addr);

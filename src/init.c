@@ -671,6 +671,8 @@ static void init_global_mutexes(void) {
     JL_MUTEX_INIT(&profile_show_peek_cond_lock, "profile_show_peek_cond_lock");
 }
 
+extern int jl_using_new_image;
+
 JL_DLLEXPORT void jl_init_(jl_image_buf_t sysimage)
 {
     // initialize many things, in no particular order
@@ -679,6 +681,8 @@ JL_DLLEXPORT void jl_init_(jl_image_buf_t sysimage)
 
     // Make sure we finalize the tls callback before starting any threads.
     (void)jl_get_pgcstack();
+
+    jl_using_new_image = !!getenv("JULIA_LOAD_NEW_IMAGE");
 
     // initialize symbol-table lock
     uv_mutex_init(&symtab_lock);
