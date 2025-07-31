@@ -2507,7 +2507,7 @@ static void jl_update_all_fptrs(jl_serializer_state *s, jl_image_t *image)
         }
     }
     // Tell LLVM about the native code
-    jl_register_fptrs(image->base, &fvars, linfos, img_fvars_max);
+    /* jl_register_fptrs(image->base, &fvars, linfos, img_fvars_max); */
 }
 
 static uint32_t write_gvars(jl_serializer_state *s, arraylist_t *globals, arraylist_t *external_fns) JL_GC_DISABLED
@@ -3083,8 +3083,8 @@ static void jl_prepare_serialization_data(jl_array_t *mod_array, jl_array_t *new
 #define LLT_ALIGN_DOWN(x, sz) ((x) & ~((sz)-1))
 static int compare_ptr_page(const void *p, const void *q)
 {
-    uintptr_t val1 = LLT_ALIGN_DOWN(*(const uintptr_t *)p, 16*1024);
-    uintptr_t val2 = LLT_ALIGN_DOWN(*(const uintptr_t *)q, 16*1024);
+    uintptr_t val1 = LLT_ALIGN_DOWN(*(const uintptr_t *)p, JL_SYSIMG_PAGE_SIZE);
+    uintptr_t val2 = LLT_ALIGN_DOWN(*(const uintptr_t *)q, JL_SYSIMG_PAGE_SIZE);
     return val1 - val2;
 }
 
@@ -3421,7 +3421,7 @@ static void jl_save_system_image2_to_stream(ios_t *f, jl_array_t *mod_array,
     ios_copyall(f, &const_data);
     ios_close(&const_data);
 
-    write_padding(f, LLT_ALIGN(ios_pos(f), 16*1024) - ios_pos(f));
+    write_padding(f, LLT_ALIGN(ios_pos(f), JL_SYSIMG_PAGE_SIZE) - ios_pos(f));
     write_uint(f, symbols.size);
     write_padding(f, LLT_ALIGN(ios_pos(f), 8) - ios_pos(f));
     ios_seek(&symbols, 0);
@@ -4329,20 +4329,22 @@ static void read_reloc_table(jl_serializer_state *s)
 
 void jl_relocate_page(void *addr);
 
-static void *jl_relocate_check(void *pv)
-{
-    uintptr_t base = (uintptr_t)jl_sysimg_start;
-    uintptr_t off = ((uintptr_t)pv) - base;
-    off = LLT_ALIGN_DOWN(off, 16*1024);
-    // printf("checking %p\n", pv);
-    if ((char *)pv >= jl_sysimg_start &&
-        (char *)pv < (jl_sysimg_start + jl_sysimg_size) &&
-        !(jl_sysimg_relocated[(off) / (16*1024*8)] & (1 << (off % 8)))
-    ) {
-        jl_relocate_page(pv);
-    }
-    return pv;
-}
+/*
+ * static void *jl_relocate_check(void *pv)
+ * {
+ *     uintptr_t base = (uintptr_t)jl_sysimg_start;
+ *     uintptr_t off = ((uintptr_t)pv) - base;
+ *     off = LLT_ALIGN_DOWN(off, JL_SYSIMG_PAGE_SIZE);
+ *     // printf("checking %p\n", pv);
+ *     if ((char *)pv >= jl_sysimg_start &&
+ *         (char *)pv < (jl_sysimg_start + jl_sysimg_size) &&
+ *         !(jl_sysimg_relocated[(off) / (JL_SYSIMG_PAGE_SIZE*8)] & (1 << (off % 8)))
+ *     ) {
+ *         jl_relocate_page(pv);
+ *     }
+ *     return pv;
+ * }
+ */
 
 void jl_breakpoint(jl_value_t *);
 
@@ -4351,25 +4353,25 @@ void jl_relocate_page(void *addr)
     // if (((uintptr_t)addr & 5) != 0)
     //     __builtin_trap();
     uintptr_t off = (((char *)addr) - jl_sysimg_start);
-    off = LLT_ALIGN_DOWN(off, 16*1024);
+    off = LLT_ALIGN_DOWN(off, JL_SYSIMG_PAGE_SIZE);
     // printf("fault at %p (offset %lx)\n", addr, off);
     uintptr_t *r =
         bsearch((void *)&off, jl_reloc_table, jl_reloc_table_len, sizeof(uintptr_t), compare_ptr_page);
     if (!r) {
         // jl_sysimg_relocated[off / (16*1024*8)] |= 1 << (off % 8);
-        mprotect((void *)(off + jl_sysimg_start), 16 * 1024, PROT_READ | PROT_WRITE);
+        mprotect((void *)(off + jl_sysimg_start), JL_SYSIMG_PAGE_SIZE, PROT_READ | PROT_WRITE);
         // printf("  could not find reloc %16lx\n", r);
         // exit(1);
         return;
     }
     uintptr_t *p1, *p2;
-    for (p1 = r; LLT_ALIGN_DOWN(*p1, 16 * 1024) == LLT_ALIGN_DOWN(off, 16 * 1024); p1--)
+    for (p1 = r; LLT_ALIGN_DOWN(*p1, JL_SYSIMG_PAGE_SIZE) == LLT_ALIGN_DOWN(off, JL_SYSIMG_PAGE_SIZE); p1--)
         ;
     p1++;
-    mprotect((void *)(off + jl_sysimg_start), 16 * 1024, PROT_READ | PROT_WRITE);
+    mprotect((void *)(off + jl_sysimg_start), JL_SYSIMG_PAGE_SIZE, PROT_READ | PROT_WRITE);
     // jl_sysimg_relocated[off / (16*1024*8)] |= 1 << (off % (16*1024*8));
     uintptr_t base = (uintptr_t)jl_sysimg_start;
-    for (p2 = p1; LLT_ALIGN_DOWN(*p2, 16 * 1024) == LLT_ALIGN_DOWN(off, 16 * 1024); p2++) {
+    for (p2 = p1; LLT_ALIGN_DOWN(*p2, JL_SYSIMG_PAGE_SIZE) == LLT_ALIGN_DOWN(off, JL_SYSIMG_PAGE_SIZE); p2++) {
         uintptr_t r = *p2;
         uintptr_t *pv = (uintptr_t *)((r & ~3) + base);
         uintptr_t v = *pv;
@@ -4448,7 +4450,7 @@ static void jl_restore_system_image2_from_stream_(
 
     size_t sizeof_sysimg = f->bpos;
 
-    ios_seek(f, LLT_ALIGN(ios_pos(f), 16*1024));
+    ios_seek(f, LLT_ALIGN(ios_pos(f), JL_SYSIMG_PAGE_SIZE));
     jl_sysimg_size = f->bpos;
     // jl_sysimg_relocated = malloc(LLT_ALIGN(jl_sysimg_size, 8) / 8);
     // bzero(jl_sysimg_relocated, jl_sysimg_size / (16 * 1024 * 8));

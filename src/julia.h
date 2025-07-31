@@ -2728,6 +2728,8 @@ typedef struct {
     int emit_metadata;
 } jl_emission_params_t;
 
+#define JL_SYSIMG_PAGE_SIZE (0x1000)
+
 #ifdef __cplusplus
 }
 #endif
