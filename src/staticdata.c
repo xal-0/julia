@@ -497,6 +497,7 @@ typedef struct {
     jl_array_t *link_ids_external_fnvars;
     jl_array_t *method_roots_list;
     htable_t method_roots_index;
+    htable_t memory_backrefs;
     uint64_t worklist_key;
     jl_query_cache *query_cache;
     jl_ptls_t ptls;
@@ -707,7 +708,8 @@ static int effects_foldable(uint32_t effects)
 
 // `jl_queue_for_serialization` adds items to `serialization_order`
 #define jl_queue_for_serialization(s, v) jl_queue_for_serialization_((s), (jl_value_t*)(v), 1, 0)
-static void jl_queue_for_serialization_(jl_serializer_state *s, jl_value_t *v, int recursive, int immediate) JL_GC_DISABLED;
+#define jl_queue_for_serialization_(s, v, recursive, immediate) jl_queue_for_serialization__(s, v, recursive, immediate, NULL)
+static void jl_queue_for_serialization__(jl_serializer_state *s, jl_value_t *v, int recursive, int immediate, jl_value_t *parent) JL_GC_DISABLED;
 
 static void jl_queue_module_for_serialization(jl_serializer_state *s, jl_module_t *m) JL_GC_DISABLED
 {
@@ -773,7 +775,7 @@ static int codeinst_may_be_runnable(jl_code_instance_t *ci, int incremental) {
 // you want to handle uniquing of `Dict{String,Float64}` before you tackle `Vector{Dict{String,Float64}}`.
 // Uniquing is done in `serialization_order`, so the very first mention of such an object must
 // be the "source" rather than merely a cross-reference.
-static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_t *v, int recursive, int immediate) JL_GC_DISABLED
+static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_t *v, int recursive, int immediate, jl_value_t *parent) JL_GC_DISABLED
 {
     jl_datatype_t *t = (jl_datatype_t*)jl_typeof(v);
     jl_queue_for_serialization_(s, (jl_value_t*)t, 1, immediate);
@@ -1004,7 +1006,7 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
     else if (jl_is_array(v)) {
         jl_array_t *ar = (jl_array_t*)v;
         jl_value_t *mem = get_replaceable_field((jl_value_t**)&ar->ref.mem, 1);
-        jl_queue_for_serialization_(s, mem, 1, immediate);
+        jl_queue_for_serialization__(s, mem, 1, immediate, v);
     }
     else if (jl_is_genericmemory(v)) {
         jl_genericmemory_t *m = (jl_genericmemory_t*)v;
@@ -1116,8 +1118,7 @@ done_fields: ;
     }
 }
 
-
-static void jl_queue_for_serialization_(jl_serializer_state *s, jl_value_t *v, int recursive, int immediate) JL_GC_DISABLED
+static void jl_queue_for_serialization__(jl_serializer_state *s, jl_value_t *v, int recursive, int immediate, jl_value_t *parent) JL_GC_DISABLED
 {
     if (!jl_needs_serialization(s, v))
         return;
@@ -1145,6 +1146,14 @@ static void jl_queue_for_serialization_(jl_serializer_state *s, jl_value_t *v, i
             immediate = 1;
     }
 
+    if (jl_is_genericmemory(v)) {
+        void **val = ptrhash_bp(&s->memory_backrefs, (void *)v);
+        if (*val == HT_NOTFOUND)
+            *val = parent;
+        else if (*val != parent)
+            *val = NULL;
+    }
+
     void **bp = ptrhash_bp(&serialization_order, v);
     assert(!immediate || *bp != (void*)(uintptr_t)-2);
     if (*bp == HT_NOTFOUND)
@@ -1154,7 +1163,7 @@ static void jl_queue_for_serialization_(jl_serializer_state *s, jl_value_t *v, i
 
     if (immediate) {
         *bp = (void*)(uintptr_t)-2; // now immediate
-        jl_insert_into_serialization_queue(s, v, recursive, immediate);
+        jl_insert_into_serialization_queue(s, v, recursive, immediate, parent);
     }
     else {
         arraylist_push(&object_worklist, (void*)v);
@@ -1182,7 +1191,7 @@ static void jl_serialize_reachable(jl_serializer_state *s) JL_GC_DISABLED
         assert(*bp != HT_NOTFOUND && *bp != (void*)(uintptr_t)-2);
         if (*bp == (void*)(uintptr_t)-1) { // might have been eagerly handled for post-order while in the lazy pre-order queue
             *bp = (void*)(uintptr_t)-2;
-            jl_insert_into_serialization_queue(s, v, 1, 0);
+            jl_insert_into_serialization_queue(s, v, 1, 0, NULL);
         }
         else {
             assert(s->incremental);
@@ -1489,6 +1498,7 @@ jl_value_t *jl_find_ptr = NULL;
 // The main function for serializing all the items queued in `serialization_order`
 // (They are also stored in `serialization_queue` which is order-preserving, unlike the hash table used
 //  for `serialization_order`).
+size_t total_saved, n_saved, n_mems, total_mem;
 static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
 {
     size_t l = serialization_queue.len;
@@ -1591,9 +1601,10 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
         else if (jl_is_genericmemory(v)) {
             assert(f == s->s);
             // Internal data for types in julia.h with `jl_genericmemory_t` field(s)
-            jl_genericmemory_t *m = (jl_genericmemory_t*)v;
+            jl_genericmemory_t *m = (jl_genericmemory_t *)v;
             const jl_datatype_layout_t *layout = t->layout;
             size_t len = m->length;
+            n_mems++;
             // if (jl_genericmemory_how(m) == 3) {
             //     jl_value_t *owner = jl_genericmemory_data_owner_field(m);
             //     write_uint(f, len);
@@ -1610,9 +1621,26 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                 int isbitsunion = layout->flags.arrayelem_isunion;
                 if (isbitsunion)
                     tot += len;
+                total_mem += tot;
                 size_t headersize = sizeof(jl_genericmemory_t);
+                if (!layout->flags.arrayelem_isunion) {
+                    void *parent = ptrhash_get(&s->memory_backrefs, (void *)m);
+                    if (parent != HT_NOTFOUND && parent != NULL) {
+                        jl_array_t *a = parent;
+                        assert(jl_array_len(a) <= len);
+                        if (a->ref.ptr_or_offset == a->ref.mem->ptr) {
+                            n_saved++;
+                            total_saved += (len - jl_array_len(a)) * layout->size;
+                            len = jl_array_len(a);
+                            datasize = len * layout->size;
+                        }
+                    }
+                }
+
                 // copy header
-                ios_write(f, (char*)v, headersize);
+                write_uint(f, len);
+                write_pointer(f);
+
                 // write data
                 if (!layout->flags.arrayelem_isboxed && layout->first_ptr < 0) {
                     // set owner to NULL
@@ -3161,6 +3189,7 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
     s.link_ids_external_fnvars = jl_alloc_array_1d(jl_array_int32_type, 0);
     s.method_roots_list = NULL;
     htable_new(&s.method_roots_index, 0);
+    htable_new(&s.memory_backrefs, 0);
     jl_value_t **_tags[NUM_TAGS];
     jl_value_t ***tags = s.incremental ? NULL : _tags;
     if (worklist) {
@@ -3305,6 +3334,9 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         external_fns_begin = write_gvars(&s, &gvars, &external_fns);
     }
 
+    printf("total: %zu B across %zu mems\n", total_mem, n_mems);
+    printf("saved: %zu B across %zu mems\n", total_saved, n_saved);
+
     // This ensures that we can use the low bit of addresses for
     // identifying end pointers in gc's eytzinger search.
     write_padding(&sysimg, 4 - (sysimg.size % 4));
@@ -3446,6 +3478,7 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
     arraylist_free(&s.gctags_list);
     arraylist_free(&gvars);
     arraylist_free(&external_fns);
+    htable_free(&s.memory_backrefs);
     htable_free(&s.method_roots_index);
     htable_free(&field_replace);
     htable_free(&bits_replace);
