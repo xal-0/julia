@@ -45,6 +45,8 @@
 using namespace llvm;
 
 #include <zstd.h>
+#include "lz4.h"
+#include "lz4hc.h"
 
 #include "jitlayers.h"
 #include "serialize.h"
@@ -2149,19 +2151,65 @@ void jl_dump_native_impl(void *native_code,
         sysimgM.setStackProtectorGuard(StackProtectorGuard);
         sysimgM.setOverrideStackAlignment(OverrideStackAlignment);
 
+        // TODO: support >2GiB
         char *compression_str = getenv("JULIA_IMAGE_COMPRESSION");
-        unsigned long compression = compression_str ? strtoul(compression_str, nullptr, 10) : 0;
+        int compression_kind = 0;
+        int compression_level = 0;
+        if (compression_str) {
+            const char *kind_s = strtok(compression_str, "-");
+            compression_kind = !strcmp(kind_s, "zstd")  ? 1 :
+                               !strcmp(kind_s, "lz4hc") ? 2 :
+                               !strcmp(kind_s, "lz4")   ? 3 :
+                               !strcmp(kind_s, "copy")  ? 4 :
+                                                          0;
+            if (!compression_kind)
+                exit(1);
+            const char *level_s = strtok(nullptr, "-");
+            compression_level = strtoul(level_s, nullptr, 10);
+        }
+        printf("[COMP] type %d, level %d\n", compression_kind, compression_level);
+        uint64_t start = jl_hrtime();
+
         ArrayRef<char> sysimg_data{z->buf, (size_t)z->size};
         SmallVector<char, 0> compressed_data;
-        if (compression) {
+        int64_t orig_size = z->size;
+        if (compression_kind == 1) {
             compressed_data.resize(ZSTD_compressBound(z->size));
             size_t comp_size = ZSTD_compress(compressed_data.data(), compressed_data.size(),
-                                             z->buf, z->size, compression);
+                                             z->buf, z->size, compression_level);
             compressed_data.resize(comp_size);
             sysimg_data = compressed_data;
             ios_close(z);
             free(z);
         }
+        else if (compression_kind == 2) {
+            compressed_data.resize(LZ4_compressBound(z->size));
+            size_t comp_size = LZ4_compress_HC(z->buf, compressed_data.data(), z->size,
+                                               compressed_data.size(), compression_level);
+            compressed_data.resize(comp_size);
+            sysimg_data = compressed_data;
+            ios_close(z);
+            free(z);
+        }
+        else if (compression_kind == 3) {
+            compressed_data.resize(LZ4_compressBound(z->size));
+            size_t comp_size = LZ4_compress_fast(z->buf, compressed_data.data(), z->size,
+                                                 compressed_data.size(), compression_level);
+            compressed_data.resize(comp_size);
+            sysimg_data = compressed_data;
+            ios_close(z);
+            free(z);
+        }
+        else if (compression_kind == 4) {
+            compressed_data.resize(z->size);
+            std::copy(z->buf, z->buf + z->size, compressed_data.begin());
+            sysimg_data = compressed_data;
+            ios_close(z);
+            free(z);
+        }
+        printf("[COMP] done, %lld B -> %zu B, ratio %.1f%% (%llu ms)\n", orig_size,
+               sysimg_data.size(), (1.0 * sysimg_data.size() / orig_size) * 100,
+               (jl_hrtime() - start) / 1000000);
 
         Constant *data = ConstantDataArray::get(Context, sysimg_data);
         auto sysdata = new GlobalVariable(sysimgM, data->getType(), false,
@@ -2176,20 +2224,28 @@ void jl_dump_native_impl(void *native_code,
 #endif
         addComdat(sysdata, TheTriple);
         Constant *len = ConstantInt::get(sysimgM.getDataLayout().getIntPtrType(Context), sysimg_data.size());
+        Constant *uncomp_len = ConstantInt::get(sysimgM.getDataLayout().getIntPtrType(Context), orig_size);
         addComdat(new GlobalVariable(sysimgM, len->getType(), true,
                                      GlobalVariable::ExternalLinkage,
                                      len, "jl_system_image_size"), TheTriple);
+        addComdat(new GlobalVariable(sysimgM, uncomp_len->getType(), true,
+                                     GlobalVariable::ExternalLinkage,
+                                     uncomp_len, "jl_system_image_uncomp_size"), TheTriple);
 
-        const char *unpack_func = compression ? "jl_image_unpack_zstd" : "jl_image_unpack_uncomp";
-        auto unpack = new GlobalVariable(sysimgM, DL.getIntPtrType(Context), true,
-                                         GlobalVariable::ExternalLinkage, nullptr,
-                                         unpack_func);
+        const char *unpack_func = compression_kind == 1 ? "jl_image_unpack_zstd" :
+                                  compression_kind == 2 ? "jl_image_unpack_lz4" :
+                                  compression_kind == 3 ? "jl_image_unpack_lz4" :
+                                  compression_kind == 4 ? "jl_image_unpack_copy" :
+                                                          "jl_image_unpack_uncomp";
+        auto unpack =
+            new GlobalVariable(sysimgM, DL.getIntPtrType(Context), true,
+                               GlobalVariable::ExternalLinkage, nullptr, unpack_func);
         addComdat(new GlobalVariable(sysimgM, PointerType::getUnqual(Context), true,
                                      GlobalVariable::ExternalLinkage, unpack,
                                      "jl_image_unpack"),
                   TheTriple);
 
-        if (!compression) {
+        if (compression_kind == 0) {
             // Free z here, since we've copied out everything into data
             // Results in serious memory savings
             ios_close(z);

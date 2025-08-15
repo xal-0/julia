@@ -62,6 +62,7 @@ SRCS := \
 	threading scheduler stackwalk null_sysimage \
 	method jlapi signal-handling safepoint timing subtype rtutils \
 	crc32c APInt-C processor ircode opaque_closure codegen-stubs coverage runtime_ccall engine \
+	lz4 lz4hc \
 	$(GC_SRCS)
 
 RT_LLVMLINK :=

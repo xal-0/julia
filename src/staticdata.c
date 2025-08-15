@@ -73,6 +73,8 @@ External links:
 #include <inttypes.h> // PRIxPTR
 
 #include <zstd.h>
+#include "lz4.h"
+#include "lz4hc.h"
 
 #include "julia.h"
 #include "julia_internal.h"
@@ -3652,6 +3654,18 @@ JL_DLLEXPORT void jl_image_unpack_uncomp(void *handle, jl_image_buf_t *image)
     image->size = *plen;
 }
 
+JL_DLLEXPORT void jl_image_unpack_copy(void *handle, jl_image_buf_t *image)
+{
+    size_t *plen;
+    char *data;
+    jl_dlsym(handle, "jl_system_image_size", (void **)&plen, 1);
+    jl_dlsym(handle, "jl_system_image_data", (void **)&data, 1);
+    jl_dlsym(handle, "jl_image_pointers", (void**)&image->pointers, 1);
+    image->size = *plen;
+    image->data = (char *)malloc(image->size);
+    memcpy((void *)image->data, data, image->size);
+}
+
 JL_DLLEXPORT void jl_image_unpack_zstd(void *handle, jl_image_buf_t *image)
 {
     size_t *plen;
@@ -3663,16 +3677,36 @@ JL_DLLEXPORT void jl_image_unpack_zstd(void *handle, jl_image_buf_t *image)
     image->size = ZSTD_getFrameContentSize(data, *plen);
     image->data = (char *)malloc(image->size);
     ZSTD_decompress((void *)image->data, image->size, data, *plen);
-    size_t len = (*plen) & ~(jl_getpagesize() - 1);
-#ifdef _OS_WINDOWS_
-    if (len)
-        VirtualFree((void *)data, len, MEM_RELEASE);
-#else
-    if (len && munmap((void *)data, len)) {
-        perror("munmap");
-        jl_exit(1);
-    }
-#endif
+/*
+ *     size_t len = (*plen) & ~(jl_getpagesize() - 1);
+ * #ifdef _OS_WINDOWS_
+ *     if (len)
+ *         VirtualFree((void *)data, len, MEM_RELEASE);
+ * #else
+ *     if (len && munmap((void *)data, len)) {
+ *         perror("munmap");
+ *         jl_exit(1);
+ *     }
+ * #endif
+ */
+}
+
+JL_DLLEXPORT void jl_image_unpack_lz4(void *handle, jl_image_buf_t *image)
+{
+    size_t *plen, len, *puncomp_len, uncomp_len;
+    const char *data;
+    jl_dlsym(handle, "jl_system_image_size", (void **)&plen, 1);
+    jl_dlsym(handle, "jl_system_image_uncomp_size", (void **)&puncomp_len, 1);
+    jl_dlsym(handle, "jl_system_image_data", (void **)&data, 1);
+    jl_dlsym(handle, "jl_image_pointers", (void**)&image->pointers, 1);
+    len = *plen;
+    uncomp_len = *puncomp_len;
+
+    image->size = uncomp_len;
+    image->data = (char *)malloc(uncomp_len);
+    int n = LZ4_decompress_safe(data, (char *)image->data, len, uncomp_len);
+    if (n != uncomp_len)
+        exit(1);
 }
 
 // From a shared library handle, verify consistency and return a jl_image_buf_t
@@ -3700,7 +3734,9 @@ static jl_image_buf_t get_image_buf(void *handle, int is_pkgimage)
         // in the usual case, the sysimage was not statically linked to libjulia-internal
         // look up the external sysimage symbols via the dynamic linker
         jl_dlsym(handle, "jl_image_unpack", (void **)&unpack, 1);
+        uint64_t start = jl_hrtime();
         (*unpack)(handle, &image);
+        /* printf("[DECOMP] (%llu) ms", (jl_hrtime() - start) / 1000000); */
     }
     else {
         // the sysimage was statically linked directly against libjulia-internal
