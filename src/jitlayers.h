@@ -715,9 +715,10 @@ private:
 };
 extern JuliaOJIT *jl_ExecutionEngine;
 std::unique_ptr<Module> jl_create_llvm_module(StringRef name, LLVMContext &ctx, const DataLayout &DL, const Triple &triple) JL_NOTSAFEPOINT;
-inline jl_codegen_output_t jl_create_codegen_output(StringRef name, orc::ThreadSafeContext ctx, const DataLayout &DL, const Triple &triple) JL_NOTSAFEPOINT {
+inline std::unique_ptr<jl_codegen_output_t> jl_create_codegen_output(StringRef name, orc::ThreadSafeContext ctx, const DataLayout &DL, const Triple &triple) JL_NOTSAFEPOINT {
     auto lock = ctx.getLock();
-    return {orc::ThreadSafeModule(jl_create_llvm_module(name, *ctx.getContext(), DL, triple), ctx)};
+    return std::make_unique<jl_codegen_output_t>(orc::ThreadSafeModule(
+        jl_create_llvm_module(name, *ctx.getContext(), DL, triple), ctx));
 }
 
 Module &jl_codegen_params_t::shared_module() JL_NOTSAFEPOINT {
