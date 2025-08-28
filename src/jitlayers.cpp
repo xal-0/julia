@@ -1609,7 +1609,22 @@ namespace {
                 PoolIdx = jl_options.opt_level;
             }
             assert(PoolIdx < N && "Invalid optimization level for compiler!");
-            return orc::SimpleCompiler(****TMs[PoolIdx])(M);
+            auto &TM = ****TMs[PoolIdx];
+            SmallVector<char, 0> ObjBufferSV;
+            {
+                raw_svector_ostream ObjStream(ObjBufferSV);
+
+                legacy::PassManager PM;
+                MCContext *Ctx;
+                if (TM.addPassesToEmitMC(PM, Ctx, ObjStream))
+                    return make_error<StringError>("Target does not support MC emission",
+                                                   inconvertibleErrorCode());
+                PM.run(M);
+            }
+            auto ObjBuffer = std::make_unique<SmallVectorMemoryBuffer>(
+                std::move(ObjBufferSV), M.getModuleIdentifier() + "-jitted-objectbuffer",
+                /*RequiresNullTerminator=*/false);
+            return ObjBuffer;
         }
 
         std::array<std::unique_ptr<JuliaOJIT::ResourcePool<std::unique_ptr<TargetMachine>>>, N> TMs;
