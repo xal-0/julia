@@ -1,0 +1,2 @@
+src:src/gc-stock.c
+src:src/gc-stock.h
