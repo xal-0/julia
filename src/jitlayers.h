@@ -282,6 +282,7 @@ struct jl_linker_info_t {
     DenseMap<std::pair<jl_code_instance_t *, jl_invoke_api_t>, orc::SymbolStringPtr>
         call_targets;
     DenseMap<void *, orc::SymbolStringPtr> global_targets;
+    DenseMap<std::pair<const char *, const char *>, orc::SymbolStringPtr> ccall_targets;
 };
 
 struct jl_emitted_output_t {
@@ -320,6 +321,8 @@ public:
 
     StringRef get_call_target(jl_code_instance_t *ci, bool specsig, bool always_inline);
 
+    Function *get_ccall_target(const char *f_name, const char *f_lib);
+
     // Discard all the context that will be invalidated when we compile the
     // module.  Must hold the context lock.
     jl_emitted_output_t finish(orc::SymbolStringPool &SSP) JL_NOTSAFEPOINT;
@@ -330,6 +333,8 @@ public:
         call_targets;
     DenseMap<jl_code_instance_t *, jl_llvm_functions_t> ci_funcs;
     SmallVector<std::pair<jl_code_instance_t *, GlobalVariable *>, 0> external_fns;
+    // symbol, library name -> declaration
+    DenseMap<std::pair<const char *, const char *>, Function *> ccall_targets;
 
     SmallVector<cfunc_decl_t,0> cfuncs;
     std::map<void*, GlobalVariable*> global_targets;
@@ -347,15 +352,6 @@ public:
     SymMapGV symMapExe;
     SymMapGV symMapDll;
     SymMapGV symMapDlli;
-    // Map from distinct callee's to its GOT entry.
-    // In principle the attribute, function type and calling convention
-    // don't need to be part of the key but it seems impossible to forward
-    // all the arguments without writing assembly directly.
-    // This doesn't matter too much in reality since a single function is usually
-    // not called with multiple signatures.
-    DenseMap<AttributeList, std::map<
-        std::tuple<GlobalVariable*, FunctionType*, CallingConv::ID>,
-        GlobalVariable*>> allPltMap;
     SmallVector<std::unique_ptr<Module>, 0> llvmcall_modules;
 
     // inputs
@@ -686,7 +682,6 @@ public:
 
     typedef ResourcePool<orc::ThreadSafeContext, 0, std::queue<orc::ThreadSafeContext>> ContextPoolT;
 
-    struct DLSymOptimizer;
     struct OptimizerT;
     struct JITPointersT;
 
@@ -809,9 +804,8 @@ private:
     // ok for the a garbage collected CISymbol to remain as a key; it will be
     // replaced when the address is reused for another CI.
     CISymbolMap CISymbols;
+    DenseMap<std::pair<const char *, const char *>, orc::SymbolStringPtr> CCallSymbols;
     jl_name_counter_t Names;
-
-    std::unique_ptr<DLSymOptimizer> DLSymOpt;
 
     //Compilation streams
     jl_locked_stream dump_emitted_mi_name_stream;

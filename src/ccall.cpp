@@ -77,11 +77,10 @@ static bool runtime_sym_gvs(jl_codectx_t &ctx, const native_sym_arg_t &symarg,
 {
     const auto &f_lib = symarg.f_lib;
     const auto &f_name = symarg.f_name;
-    // If f_name isn't constant or f_lib_expr is present but not present,
+    // If f_name isn't constant or f_lib is present but not constant,
     // emit a local cache for sym, but do not cache lib
     if (!((f_lib || symarg.f_lib_expr == NULL) && f_name)) {
-        std::string name = "dynccall_";
-        name += std::to_string(jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1));
+        std::string name = ctx.emission_context.make_name(JL_SYM_CCALL_SYM);
         Module *M = jl_Module;
         auto T_pvoidfunc = getPointerTy(M->getContext());
         lib = nullptr;
@@ -112,14 +111,13 @@ static bool runtime_sym_gvs(jl_codectx_t &ctx, const native_sym_arg_t &symarg,
         symMap = &ctx.emission_context.symMapDefault;
     }
     else {
-        std::string name = "ccalllib_";
-        name += llvm::sys::path::filename(f_lib);
-        name += std::to_string(jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1));
+        std::string name = ctx.emission_context.make_name(JL_SYM_CCALL_LIB,
+                                                          llvm::sys::path::filename(f_lib));
         runtime_lib = true;
         auto &libgv = ctx.emission_context.libMapGV[f_lib];
         if (libgv.first == NULL) {
             libptrgv = new GlobalVariable(*M, getPointerTy(M->getContext()), false,
-                                          GlobalVariable::ExternalLinkage,
+                                          GlobalVariable::InternalLinkage,
                                           Constant::getNullValue(getPointerTy(M->getContext())), name);
             libgv.first = libptrgv;
         }
@@ -131,13 +129,13 @@ static bool runtime_sym_gvs(jl_codectx_t &ctx, const native_sym_arg_t &symarg,
 
     GlobalVariable *&llvmgv = (*symMap)[f_name];
     if (llvmgv == NULL) {
-        std::string name = "ccall_";
+        std::string name = JL_SYM_CCALL_SYM;
         name += f_name;
         name += "_";
         name += std::to_string(jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1));
         auto T_pvoidfunc = getPointerTy(M->getContext());
         llvmgv = new GlobalVariable(*M, T_pvoidfunc, false,
-                                    GlobalVariable::ExternalLinkage,
+                                    GlobalVariable::InternalLinkage,
                                     Constant::getNullValue(T_pvoidfunc), name);
     }
 
@@ -251,124 +249,6 @@ static Value *runtime_sym_lookup(
         llvmgv = prepare_global_in(jl_Module, llvmgv);
     }
     return runtime_sym_lookup(ctx.emission_context, ctx.builder, &ctx, symarg, f, libptrgv, llvmgv, runtime_lib);
-}
-
-// Emit a "PLT" entry that will be lazily initialized
-// when being called the first time.
-static GlobalVariable *emit_plt_thunk(
-        jl_codectx_t &ctx,
-        FunctionType *functype, const AttributeList &attrs,
-        CallingConv::ID cc, const native_sym_arg_t &symarg,
-        GlobalVariable *libptrgv, GlobalVariable *llvmgv,
-        bool runtime_lib)
-{
-    ++PLTThunks;
-    bool shared = libptrgv != nullptr;
-    assert(shared && "not yet supported by runtime_sym_lookup");
-    auto M = &ctx.emission_context.get_module();
-    if (shared) {
-        assert(symarg.f_name);
-        libptrgv = prepare_global_in(M, libptrgv);
-        llvmgv = prepare_global_in(M, llvmgv);
-    }
-    std::string fname;
-    if (symarg.f_name)
-        raw_string_ostream(fname) << "jlplt_" << symarg.f_name << "_" << jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1);
-    else
-        raw_string_ostream(fname) << "jldynplt_" << jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1);
-    Function *plt = Function::Create(functype,
-                                     GlobalVariable::PrivateLinkage,
-                                     fname, M);
-    plt->setAttributes(attrs);
-    if (cc != CallingConv::C)
-        plt->setCallingConv(cc);
-    auto T_pvoidfunc = getPointerTy(M->getContext());
-    GlobalVariable *got = new GlobalVariable(*M, T_pvoidfunc, false,
-                                             shared ? GlobalVariable::ExternalLinkage : GlobalVariable::PrivateLinkage,
-                                             plt,
-                                             fname + "_got");
-    if (shared) {
-        if (runtime_lib)
-            got->addAttribute("julia.libname", symarg.f_lib);
-        else
-            got->addAttribute("julia.libidx", std::to_string((uintptr_t) symarg.f_lib));
-        got->addAttribute("julia.fname", symarg.f_name);
-    }
-    BasicBlock *b0 = BasicBlock::Create(M->getContext(), "top", plt);
-    IRBuilder<> irbuilder(b0);
-    Value *ptr = runtime_sym_lookup(ctx.emission_context, irbuilder, NULL, symarg, plt, libptrgv,
-                                    llvmgv, runtime_lib);
-    StoreInst *store = irbuilder.CreateAlignedStore(ptr, got, Align(sizeof(void*)));
-    store->setAtomic(AtomicOrdering::Release);
-    SmallVector<Value*, 16> args;
-    for (auto &arg : plt->args())
-        args.push_back(&arg);
-    CallInst *ret = irbuilder.CreateCall(
-        functype,
-        ptr, ArrayRef<Value*>(args));
-    ret->setAttributes(attrs);
-    if (cc != CallingConv::C)
-        ret->setCallingConv(cc);
-    // NoReturn function can trigger LLVM verifier error when declared as
-    // MustTail since other passes might replace the `ret` with
-    // `unreachable` (LLVM should probably accept `unreachable`).
-    if (hasFnAttr(attrs, Attribute::NoReturn)) {
-        irbuilder.CreateUnreachable();
-    }
-    else {
-        // musttail support is very bad on ARM, PPC, PPC64 (as of LLVM 3.9)
-        // Known failures includes vararg (not needed here) and sret.
-        if (ctx.emission_context.TargetTriple.isX86() || (ctx.emission_context.TargetTriple.isAArch64() && !ctx.emission_context.TargetTriple.isOSDarwin())) {
-            // Ref https://bugs.llvm.org/show_bug.cgi?id=47058
-            // LLVM, as of 10.0.1 emits wrong/worse code when musttail is set
-            // Apple silicon macs give an LLVM ERROR if musttail is set here #44107.
-            if (!attrs.hasAttrSomewhere(Attribute::ByVal))
-                ret->setTailCallKind(CallInst::TCK_MustTail);
-        }
-        if (functype->getReturnType() == getVoidTy(irbuilder.getContext())) {
-            irbuilder.CreateRetVoid();
-        }
-        else {
-            irbuilder.CreateRet(ret);
-        }
-    }
-    irbuilder.ClearInsertionPoint();
-
-    return got;
-}
-
-static Value *emit_plt(
-        jl_codectx_t &ctx,
-        FunctionType *functype,
-        const AttributeList &attrs,
-        CallingConv::ID cc, const native_sym_arg_t &symarg)
-{
-    ++PLT;
-    // Don't do this for vararg functions so that the `musttail` is only
-    // an optimization and is not required to function correctly.
-    assert(!functype->isVarArg());
-    GlobalVariable *libptrgv;
-    GlobalVariable *llvmgv;
-    bool runtime_lib = runtime_sym_gvs(ctx, symarg, libptrgv, llvmgv);
-    if (!libptrgv)
-        return runtime_sym_lookup(ctx, symarg, ctx.f);
-
-    auto &pltMap = ctx.emission_context.allPltMap[attrs];
-    auto key = std::make_tuple(llvmgv, functype, cc);
-    GlobalVariable *&sharedgot = pltMap[key];
-    if (!sharedgot) {
-        sharedgot = emit_plt_thunk(ctx,
-                functype, attrs, cc, symarg, libptrgv, llvmgv, runtime_lib);
-    }
-    GlobalVariable *got = prepare_global_in(jl_Module, sharedgot);
-    LoadInst *got_val = ctx.builder.CreateAlignedLoad(got->getValueType(), got, Align(sizeof(void*)));
-    setName(ctx.emission_context, got_val, symarg.f_name);
-    // See comment in `runtime_sym_lookup` above. This in principle needs a
-    // consume ordering too. This is even less likely to cause issues though
-    // since the only thing we do to this loaded pointer is to call it
-    // immediately.
-    got_val->setAtomic(AtomicOrdering::Unordered);
-    return got_val;
 }
 
 // --- ABI Implementations ---
@@ -2215,25 +2095,11 @@ jl_cgval_t function_sig_t::emit_a_ccall(
         null_pointer_check(ctx, symarg.jl_ptr, nullptr);
         llvmf = symarg.jl_ptr;
     }
-    else if (!ctx.params->use_jlplt) {
-        if ((symarg.f_lib && !((symarg.f_lib == JL_EXE_LIBNAME) ||
-              (symarg.f_lib == JL_LIBJULIA_INTERNAL_DL_LIBNAME) ||
-              (symarg.f_lib == JL_LIBJULIA_DL_LIBNAME))) || symarg.f_lib_expr) {
-            // n.b. this is not semantically valid, but use_jlplt=1 when semantic correctness is desired
-            emit_error(ctx, "ccall: Had library expression, but symbol lookup was disabled");
-        }
-        if (symarg.f_name == nullptr)
-            emit_error(ctx, "ccall: Had name expression, but symbol lookup was disabled");
-        llvmf = jl_Module->getOrInsertFunction(symarg.f_name, functype).getCallee();
+    else if (symarg.f_name && (symarg.f_lib || !symarg.f_lib_expr)) {
+        llvmf = ctx.emission_context.get_ccall_target(symarg.f_name, symarg.f_lib);
     }
     else {
-        ++DeferredCCallLookups;
-        // vararg requires musttail,
-        // but musttail is incompatible with noreturn.
-        if (functype->isVarArg())
-            llvmf = runtime_sym_lookup(ctx, symarg, ctx.f);
-        else
-            llvmf = emit_plt(ctx, functype, attributes, cc, symarg);
+        llvmf = runtime_sym_lookup(ctx, symarg, ctx.f);
     }
 
     // Potentially we could add gc_uses to `gc-transition`, instead of emitting them separately as jl_roots

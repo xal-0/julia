@@ -461,10 +461,20 @@ typedef enum {
 #define JL_SYM_PROTO_ARGS    "j1_"
 #define JL_SYM_PROTO_SPECSIG "j_"
 
+// Symbol prefix for the PLT thunk to invoke a CodeInstance in another image
+#define JL_SYM_INVOKE_PLT "jlpkg_"
 // Symbol prefix for the GOT entry for a CodeInstance PLT
-#define JL_SYM_JLPLT_GOT "jlpkg_got_"
-// Symbol prefix for the PLT thunk for a CodeInstance
-#define JL_SYM_JLPLT "jlpkg_"
+#define JL_SYM_INVOKE_GOT "jlpkg_got_"
+
+// Symbol prefix for the PLT thunk to a ccall
+#define JL_SYM_CCALL_PLT "jlplt_"
+// Symbol for the ccall PLT GOT table
+#define JL_SYM_CCALL_GOT "jlplt_got"
+
+// Symbol prefix for cached symbol address for ccall/cglobal
+#define JL_SYM_CCALL_SYM "ccall_"
+// Symbol prefix for cached library handle for ccall/cglobal
+#define JL_SYM_CCALL_LIB "ccalllib_"
 
 typedef enum {
     JL_SYMBOL_INVOKE_DEF,
@@ -1751,6 +1761,7 @@ JL_DLLIMPORT void *jl_jit_abi_converter(jl_task_t *ct, jl_abi_t from_abi, jl_cod
 #define JL_EXE_LIBNAME                  ((const char*)1)
 #define JL_LIBJULIA_DL_LIBNAME          ((const char*)2)
 #define JL_LIBJULIA_INTERNAL_DL_LIBNAME ((const char*)3)
+#define JL_MAX_BUILTIN_LIBNAME          JL_LIBJULIA_INTERNAL_DL_LIBNAME
 JL_DLLEXPORT const char *jl_dlfind(const char *name);
 
 // libuv wrappers:

@@ -299,10 +299,9 @@ static const char *const common_names[256] = {
 // most are given "friendly" abbreviations
 // the remaining few will print as hex
 // e.g. mangles "llvm.a≠a$a!a##" as "llvmDOT.a≠a$aNOT.aYY.YY."
-static void makeSafeName(GlobalObject &G)
+static SmallString<32> makeSafeName(StringRef Name)
 {
-    StringRef Name = G.getName();
-    SmallVector<char, 32> SafeName;
+    SmallString<32> SafeName;
     for (unsigned char c : Name.bytes()) {
         if (is_safe_char(c)) {
             SafeName.push_back(c);
@@ -321,8 +320,15 @@ static void makeSafeName(GlobalObject &G)
             SafeName.push_back('.');
         }
     }
-    if (SafeName.size() != Name.size())
-        G.setName(StringRef(SafeName.data(), SafeName.size()));
+    return SafeName;
+
+}
+
+static void makeSafeName(GlobalObject &G)
+{
+    auto SafeName = makeSafeName(G.getName());
+    if (SafeName.size() != G.getName().size())
+        G.setName(SafeName);
 }
 
 namespace { // file-local namespace
@@ -588,19 +594,20 @@ void *jl_create_native_impl(LLVMOrcThreadSafeModuleRef llvmmod, int trim, int ex
                 Function::ExternalLinkage, "__julia_personality", M);
             juliapersonality_func->setDLLStorageClass(GlobalValue::DLLImportStorageClass);
         }
-        for (GlobalObject &G : M.global_objects()) {
-            if (!G.isDeclaration()) {
-                G.setLinkage(GlobalValue::InternalLinkage);
-                G.setDSOLocal(true);
-                makeSafeName(G);
-                if (Function *F = dyn_cast<Function>(&G)) {
-                    if (juliapersonality_func) {
-                        // Add unwind exception personalities to functions to handle async exceptions
-                        F->setPersonalityFn(juliapersonality_func);
-                    }
-                }
-            }
-        }
+        // TODO: bring this back
+        // for (GlobalObject &G : M.global_objects()) {
+        //     if (!G.isDeclaration()) {
+        //         G.setLinkage(GlobalValue::InternalLinkage);
+        //         G.setDSOLocal(true);
+        //         makeSafeName(G);
+        //         if (Function *F = dyn_cast<Function>(&G)) {
+        //             if (juliapersonality_func) {
+        //                 // Add unwind exception personalities to functions to handle async exceptions
+        //                 F->setPersonalityFn(juliapersonality_func);
+        //             }
+        //         }
+        //     }
+        // }
     });
 
     if (timed) {
@@ -614,93 +621,107 @@ void *jl_create_native_impl(LLVMOrcThreadSafeModuleRef llvmmod, int trim, int ex
 }
 
 // x16, x17 (ip0, ip1) are the intra-procedure-call scratch registers
-const char *plt_asm_aarch64_macho =
-    "adrp  x16, ${0}@page\n"
-    "ldr   x16, [x16, ${0}@pageoff]\n"
-    "br    x16\n";
+static const char *plt_header_asm_aarch64_macho =
+    "    .private_extern _jlplt_header\n"
+    "_jlplt_header:\n"
+    "    adrp  x17, (_" JL_SYM_CCALL_GOT " + 8)@page\n"
+    "    add   x17, x17, (_" JL_SYM_CCALL_GOT " + 8)@pageoff\n"
+    "    stp   x16, x17, [sp, #-0x10]!\n"
+    "    adrp  x17, _" JL_SYM_CCALL_GOT "@page\n"
+    "    ldr   x17, [x17, _" JL_SYM_CCALL_GOT "@pageoff]\n"
+    "    br    x17\n";
 
-const char *plt_asm_aarch64 =
-    "adrp  x16, ${0}\n"
-    "ldr   x16, [x16, :lo12:${0}]\n"
-    "br    x16\n";
+static const char *plt_thunk_asm_aarch64_macho =
+    "    .private_extern {0}\n"
+    "{0}:\n"
+    "    adrp  x16, ({1} + {2})@page\n"
+    "    ldr   x17, [x16, ({1} + {2})@pageoff]\n"
+    "    add   x16, x16, ({1} + {2})@pageoff\n"
+    "    br    x17\n";
 
-const char *plt_asm_x86_64 =
+static const char *plt_thunk_asm_aarch64 =
+    "    .hidden {0}\n"
+    "{0}:\n"
+    "    adrp  x16, {1}\n"
+    "    ldr   x17, [x16, :lo12:{1}]\n"
+    "    add   x16, x16, :lo12:{1}\n"
+    "    br    x17\n";
+
+static const char *plt_thunk_asm_x86_64 =
     "jmpq  *${0:a}\n";
 
-const char *plt_asm_riscv64 =
+/*
+  These need to be tested before being enabled.
+
+static const char *plt_thunk_asm_riscv64 =
     "1b: auipc t3, %pcrel_hi(${0})\n"
     "    ld    t3, %pcrel_lo(1b)(t3)\n"
-    "    jalr  t1, t3";
+    "    jalr  t1, t3\n";
 
-const char *plt_asm_riscv32 =
+static const char *plt_thunk_asm_riscv32 =
     "1b: auipc t3, %pcrel_hi(${0})\n"
     "    lw    t3, %pcrel_lo(1b)(t3)\n"
-    "    jalr  t1, t3";
+    "    jalr  t1, t3\n";
+*/
+
+static SmallString<64> escape_sym(StringRef Orig, bool Underscore = false)
+{
+    SmallString<64> Sym;
+    raw_svector_ostream OS{Sym};
+    OS << "\"";
+    if (Underscore)
+        OS << "_";
+    OS.write_escaped(Orig);
+    OS << "\"";
+    return Sym;
+}
+
+static SmallString<256> get_plt_thunk_asm(jl_codegen_output_t &Out, StringRef SymOrig,
+                                          StringRef GOTOrig, int Idx)
+{
+    auto OF = Out.TargetTriple.getObjectFormat();
+    if (Out.TargetTriple.isAArch64()) {
+        if (OF == Triple::MachO)
+            return formatv(plt_thunk_asm_aarch64_macho, escape_sym(SymOrig, true),
+                           escape_sym(GOTOrig, true), Idx * 8);
+        else
+            return formatv(plt_thunk_asm_aarch64, escape_sym(SymOrig), escape_sym(GOTOrig),
+                           Idx * 8);
+    }
+    else if (Out.TargetTriple.getArch() == Triple::x86_64) {
+        return formatv(plt_thunk_asm_x86_64, escape_sym(SymOrig), escape_sym(GOTOrig),
+                       Idx * 8);
+    }
+    // TODO: i386, riscv32, riscv64, ppc64
+    assert(false && "unsupported target architecture");
+}
+
+static Function *emit_plt_thunk(jl_codegen_output_t &Out, StringRef Name, StringRef GOT,
+                                int Idx)
+{
+    auto &Ctx = Out.get_context();
+    auto FTy = FunctionType::get(Type::getVoidTy(Ctx), false);
+    auto F = Function::Create(FTy, Function::ExternalLinkage, 0, Name, &Out.get_module());
+    Out.get_module().appendModuleInlineAsm(get_plt_thunk_asm(Out, Name, GOT, Idx));
+    return F;
+}
 
 // Emit a thunk that calls a compiled CodeInstance from an external image.
-static Function *emit_pkg_plt_thunk(jl_codegen_output_t &out, jl_code_instance_t *ci,
+static Function *emit_pkg_plt_thunk(jl_codegen_output_t &Out, jl_code_instance_t *CI,
                                     Function *CallSite)
 {
-    auto &M = out.get_module();
-    auto &Ctx = out.get_context();
+    auto &M = Out.get_module();
+    auto &Ctx = Out.get_context();
     Type *PtrTy = PointerType::getUnqual(Ctx);
-    StringRef Name = name_from_method_instance(jl_get_ci_mi(ci));
-    auto GVName = out.make_name(JL_SYM_JLPLT_GOT, Name);
-
-    auto GV = new GlobalVariable(M, PtrTy, false, GlobalVariable::ExternalLinkage, nullptr,
-                                 GVName);
-
-
-    const char *Code = nullptr;
-    auto OF = out.TargetTriple.getObjectFormat();
-    if (out.TargetTriple.isAArch64()) {
-        if (OF == Triple::MachO)
-            Code = plt_asm_aarch64_macho;
-        else
-            Code = plt_asm_aarch64;
-    }
-    else if (out.TargetTriple.getArch() == Triple::x86_64) {
-        Code = plt_asm_x86_64;
-    }
-    else if (out.TargetTriple.getArch() == Triple::riscv64) {
-        Code = plt_asm_riscv64;
-    }
-    else if (out.TargetTriple.getArch() == Triple::riscv32) {
-        Code = plt_asm_riscv32;
-    }
-
-    auto FTy = FunctionType::get(Type::getVoidTy(Ctx), !Code);
-    auto F = Function::Create(FTy, Function::PrivateLinkage, 0,
-                              out.make_name(JL_SYM_JLPLT, Name), &M);
+    StringRef Name = name_from_method_instance(jl_get_ci_mi(CI));
+    auto GOT = new GlobalVariable(M, PtrTy, false, GlobalVariable::ExternalLinkage,
+                                  Constant::getNullValue(PtrTy),
+                                  Out.make_name(JL_SYM_INVOKE_GOT, Name));
+    Function *F =
+        emit_plt_thunk(Out, Out.make_name(JL_SYM_INVOKE_PLT, Name), GOT->getName(), 0);
     F->setCallingConv(CallSite->getCallingConv());
-    AttrBuilder Attrs{Ctx};
-    Attrs.addAttribute(Attribute::NoInline);
-    Attrs.addAttribute(Attribute::NoUnwind);
-    Attrs.addAttribute("frame-pointer", "none");
-    Attrs.addAttribute("thunk");
 
-    IRBuilder<> B{Ctx};
-    auto BB = BasicBlock::Create(Ctx, "", F);
-    B.SetInsertPoint(BB);
-
-    if (Code) {
-        Attrs.addAttribute(Attribute::Naked);
-        auto AsmTy = FunctionType::get(Type::getVoidTy(Ctx), {PtrTy}, false);
-        auto Call = B.CreateCall(InlineAsm::get(AsmTy, Code, "s", true, false), {GV});
-        Call->addFnAttr(Attribute::NoReturn);
-        B.CreateUnreachable();
-    }
-    else {
-        // Generic fallback that may be inefficient but won't mangle registers.
-        auto FPtr = B.CreateAlignedLoad(PtrTy, GV, out.DL.getPointerABIAlignment(0));
-        auto Call = B.CreateCall(FTy, FPtr, {});
-        Call->setTailCallKind(CallInst::TCK_MustTail);
-        Call->setCallingConv(F->getCallingConv());
-        B.CreateRetVoid();
-    }
-    F->addFnAttrs(Attrs);
-
-    out.external_fns.emplace_back(ci, GV);
+    Out.external_fns.emplace_back(CI, GOT);
     return F;
 }
 
@@ -724,6 +745,93 @@ static jl_compiled_functions_t::iterator get_ci_equiv_compiled(jl_code_instance_
         }
     }
     return compiled_functions.end();
+}
+
+static GlobalVariable *make_string(LLVMContext &Ctx, Module &M, StringRef S)
+{
+    Constant *Data = ConstantDataArray::getString(Ctx, S);
+    auto GV =
+        new GlobalVariable(M, Data->getType(), true, GlobalVariable::PrivateLinkage, Data);
+    GV->setUnnamedAddr(GlobalVariable::UnnamedAddr::Global);
+    return GV;
+}
+
+static Constant *make_const_array_ptr(Module &M, Type *Ty, ArrayRef<Constant *> Data)
+{
+    Constant *C = ConstantArray::get(ArrayType::get(Ty, Data.size()), Data);
+    return new GlobalVariable(M, C->getType(), true, GlobalVariable::PrivateLinkage, C);
+}
+
+static void aot_link_ccall_plt(jl_codegen_output_t &Out)
+{
+    auto &Ctx = Out.get_context();
+    auto &Mod = Out.get_module();
+
+    Out.get_module().appendModuleInlineAsm(
+        plt_header_asm_aarch64_macho); // TODO: switch on architecture
+
+    int Idx = 2;
+    // PLT GOT index -> symbol name, library index map
+    SmallVector<std::pair<const char *, int>> CSymbols;
+    // Library index -> library name
+    SmallVector<const char *> Libs;
+
+    for (auto &[CCall, Target] : Out.ccall_targets) {
+        Function *F =
+            emit_plt_thunk(Out, (Twine(JL_SYM_CCALL_PLT) + Target->getName()).str(),
+                           JL_SYM_CCALL_GOT, Idx++);
+        Target->replaceAllUsesWith(F);
+        Target->eraseFromParent();
+
+        auto [Symbol, Lib] = CCall;
+        auto I = std::find(Libs.begin(), Libs.end(), Lib);
+        if (I == Libs.end()) {
+            Libs.push_back(Lib);
+            I = Libs.end() - 1;
+        }
+        CSymbols.emplace_back(Symbol, I - Libs.begin());
+    }
+
+    Type *PtrTy = PointerType::getUnqual(Ctx);
+    Type *IntPtrTy = Mod.getDataLayout().getIntPtrType(PtrTy);
+    auto CSymEntryTy = StructType::get(PtrTy, IntPtrTy);
+
+    SmallVector<Constant *, 0> LibTable;
+    SmallVector<Constant *, 0> CSymTable;
+
+    for (auto [I, Lib] : enumerate(Libs))
+        LibTable.push_back(Lib > JL_MAX_BUILTIN_LIBNAME ?
+                               make_string(Ctx, Mod, Lib) :
+                               ConstantExpr::getIntToPtr(
+                                   ConstantInt::get(IntPtrTy, (uint64_t)Lib), PtrTy));
+
+    for (auto [I, Entry] : enumerate(CSymbols)) {
+        auto [Sym, LibIdx] = Entry;
+        CSymTable.push_back(ConstantStruct::get(CSymEntryTy, make_string(Ctx, Mod, Sym),
+                                                ConstantInt::get(IntPtrTy, LibIdx)));
+    }
+
+    Constant *CCallTablePtrs[] = {
+        make_const_array_ptr(Mod, PtrTy, LibTable),
+        make_const_array_ptr(Mod, CSymEntryTy, CSymTable),
+    };
+    auto CCallTableData = ConstantStruct::getAnon(CCallTablePtrs);
+    auto CCallTable = new GlobalVariable(Mod, CCallTableData->getType(), true,
+                                         GlobalValue::InternalLinkage, CCallTableData,
+                                         "jlplt_ccall_table");
+
+    auto FTy = FunctionType::get(Type::getVoidTy(Ctx), false);
+    auto Header = Function::Create(FTy, Function::ExternalLinkage, "jlplt_header", Mod);
+    auto Resolve =
+        Function::Create(FTy, Function::ExternalLinkage, "jl_ccall_plt_resolve", Mod);
+
+    ArrayType *GOTTy = ArrayType::get(PtrTy, Idx);
+    SmallVector<Constant *, 0> GOT{(size_t)Idx, Header};
+    GOT[0] = Resolve;
+    GOT[1] = CCallTable;
+    auto GV = new GlobalVariable(Mod, GOTTy, false, GlobalVariable::ExternalLinkage,
+                                 ConstantArray::get(GOTTy, GOT), JL_SYM_CCALL_GOT);
+    GV->setVisibility(GlobalVariable::HiddenVisibility);
 }
 
 // Static version of JuliaOJIT::linkOutput
@@ -763,6 +871,9 @@ static void aot_link_output(jl_codegen_output_t &out)
         target.decl->replaceAllUsesWith(funcs.specptr);
         target.decl->eraseFromParent();
     }
+
+    // TODO: offer a way to disable ccall PLT generation?
+    aot_link_ccall_plt(out);
 }
 
 // also be used be extern consumers like GPUCompiler.jl to obtain a module containing
@@ -1444,12 +1555,13 @@ static AOTOutputs add_output_impl(Module &M, TargetMachine &SourceTM, ShardTimer
         optimizer.run(M);
         assert(!verifyLLVMIR(M));
         bool inject_aliases = false;
-        for (auto &F : M.functions()) {
-            if (!F.isDeclaration() && F.getName() != "_DllMainCRTStartup") {
-                inject_aliases = true;
-                break;
-            }
-        }
+        // TODO: reenable this
+        // for (auto &F : M.functions()) {
+        //     if (!F.isDeclaration() && F.getName() != "_DllMainCRTStartup") {
+        //         inject_aliases = true;
+        //         break;
+        //     }
+        // }
         // no need to inject aliases if we have no functions
 
         if (inject_aliases) {

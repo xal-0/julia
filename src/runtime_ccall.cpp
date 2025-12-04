@@ -62,6 +62,29 @@ void *jl_load_and_lookup(const char *f_lib, const char *f_name, _Atomic(void*) *
     return ptr;
 }
 
+struct ccall_sym_entry {
+    const char *symbol;
+    size_t lib_idx;
+};
+
+struct ccall_table {
+    const char **libs;
+    const ccall_sym_entry *symbols;
+};
+
+// TODO: library handles
+extern "C" JL_DLLEXPORT void *jl_ccall_resolve(const ccall_table *table,
+                                               std::atomic<void *> *plt_got, size_t idx)
+{
+    void *ptr;
+    auto entry = table->symbols[idx];
+    void *lib = jl_get_library(table->libs[entry.lib_idx]);
+    jl_dlsym(lib, entry.symbol, &ptr, 1, 1);
+    jl_printf(JL_STDERR, "resolving idx %zu : %s -> %p\n", idx, entry.symbol, ptr);
+    jl_atomic_store_release(plt_got + idx, ptr);
+    return ptr;
+}
+
 // jl_load_and_lookup, but with library computed at run time on first call
 extern "C" JL_DLLEXPORT
 void *jl_lazy_load_and_lookup(jl_value_t *lib_val, jl_value_t *f_name)
