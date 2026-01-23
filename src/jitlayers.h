@@ -282,11 +282,46 @@ private:
     StringMap<unsigned> counter;
 };
 
+struct jl_csymbol_t {
+    // f_name and f_lib are non-owning pointers to the symbol table
+    // f_lib may also be NULL, or one of the special libnames (JL_*_LIBNAME)
+    const char *f_name;
+    const char *f_lib;
+    bool func;                  // func -> ccall, !func -> cglobal
+};
+
+template<>
+struct llvm::DenseMapInfo<jl_csymbol_t> {
+    using T = std::tuple<const char *, const char *, char>;
+    using TI = DenseMapInfo<T>;
+    static jl_csymbol_t from(T x)
+    {
+        auto [a, b, c] = x;
+        return {a, b, c != 0};
+    }
+    static T to(jl_csymbol_t x)
+    {
+        auto [a, b, c] = x;
+        return {a, b, c};
+    }
+    static inline jl_csymbol_t getEmptyKey() { return from(TI::getEmptyKey()); }
+    static inline jl_csymbol_t getTombstoneKey() { return from(TI::getTombstoneKey()); }
+    static unsigned getHashValue(const jl_csymbol_t &Val)
+    {
+        return TI::getHashValue(to(Val));
+    }
+    static bool isEqual(const jl_csymbol_t &LHS, const jl_csymbol_t &RHS)
+    {
+        return to(LHS) == to(RHS);
+    }
+};
+
 struct jl_linker_info_t {
     DenseMap<jl_code_instance_t *, jl_codeinst_funcs_t<orc::SymbolStringPtr>> ci_funcs;
     DenseMap<std::pair<jl_code_instance_t *, jl_invoke_api_t>, orc::SymbolStringPtr>
         call_targets;
     DenseMap<void *, orc::SymbolStringPtr> global_targets;
+    DenseMap<jl_csymbol_t, orc::SymbolStringPtr> csymbol_targets;
 };
 
 struct jl_emitted_output_t {
@@ -324,6 +359,7 @@ public:
     std::string make_name(StringRef orig_name);
 
     StringRef get_call_target(jl_code_instance_t *ci, bool specsig, bool always_inline);
+    GlobalObject *get_csymbol_target(const char *f_name, const char *f_lib, bool func);
 
     // Discard all the context that will be invalidated when we compile the
     // module.  Must hold the context lock.
@@ -335,6 +371,8 @@ public:
         call_targets;
     DenseMap<jl_code_instance_t *, jl_llvm_functions_t> ci_funcs;
     SmallVector<std::pair<jl_code_instance_t *, GlobalVariable *>, 0> external_fns;
+    // symbol, library name -> declaration
+    DenseMap<jl_csymbol_t, GlobalObject *> csymbol_targets;
 
     SmallVector<cfunc_decl_t,0> cfuncs;
     std::map<void*, GlobalVariable*> global_targets;
@@ -538,6 +576,7 @@ using CISymbolMap = DenseMap<jl_code_instance_t *, CISymbolPtr>;
 
 class JLMaterializationUnit;
 class JLTrampolineMaterializationUnit;
+class CSymbolDefinitionGenerator;
 
 struct JITObjectInfo {
     std::unique_ptr<MemoryBuffer> BackingBuffer;
@@ -566,6 +605,7 @@ public:
 class JuliaOJIT {
     friend JLMaterializationUnit;
     friend JLTrampolineMaterializationUnit;
+    friend CSymbolDefinitionGenerator;
 private:
     // any verification the user wants to do when adding an OwningResource to the pool
     template <typename AnyT>
@@ -696,7 +736,6 @@ public:
 
     typedef ResourcePool<orc::ThreadSafeContext, 0, std::queue<orc::ThreadSafeContext>> ContextPoolT;
 
-    struct DLSymOptimizer;
     struct OptimizerT;
     struct JITPointersT;
 
@@ -761,10 +800,6 @@ public:
     std::string getMangledName(StringRef Name) JL_NOTSAFEPOINT;
     std::string getMangledName(const GlobalValue *GV) JL_NOTSAFEPOINT;
 
-    // Note that this is a potential safepoint due to jl_get_library_ and jl_dlsym calls
-    // but may be called from inside safe-regions due to jit compilation locks
-    void optimizeDLSyms(Module &M) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER;
-
 protected:
     // Choose globally unique names for the functions defined by the given CI
     // and register the mapping in CISymbols.
@@ -797,6 +832,13 @@ protected:
     // returning a pointer into CISymbols or NULL if the CI is not compiled.
     CISymbolPtr *linkCISymbol(jl_code_instance_t *CI) JL_NOTSAFEPOINT;
 
+    orc::SymbolStringPtr linkCSymbol(orc::MaterializationResponsibility &MR,
+                                         const char *FName,
+                                         const char *LibName) JL_NOTSAFEPOINT;
+
+    void defineCSymbols(orc::JITDylib &JD, const orc::SymbolLookupSet &Symbols)
+        JL_NOTSAFEPOINT_ENTER JL_NOTSAFEPOINT_LEAVE;
+
     orc::ThreadSafeModule optimizeModule(orc::ThreadSafeModule TSM) JL_NOTSAFEPOINT;
     std::unique_ptr<MemoryBuffer> compileModule(orc::ThreadSafeModule TSM) JL_NOTSAFEPOINT;
 
@@ -812,15 +854,16 @@ private:
     std::mutex SharedBytesMutex{};
     SharedBytesT SharedBytes;
 
-    // LinkerMutex protects CISymbols, Names
+    // LinkerMutex protects CISymbols, CCallSymbols, CCallSymbolInfo, LibHandles, Names
     std::mutex LinkerMutex;
     // CISymbols maps CodeInstance (weak) pointers to their ORC symbols.  It is
     // ok for the a garbage collected CISymbol to remain as a key; it will be
     // replaced when the address is reused for another CI.
     CISymbolMap CISymbols;
+    DenseMap<std::pair<const char *, const char *>, orc::SymbolStringPtr> CSymbols;
+    DenseMap<orc::NonOwningSymbolStringPtr, std::pair<const char *, const char *>>
+        CSymbolInfo;
     jl_name_counter_t Names;
-
-    std::unique_ptr<DLSymOptimizer> DLSymOpt;
 
     //Compilation streams
     jl_locked_stream dump_emitted_mi_name_stream;
@@ -854,8 +897,6 @@ inline orc::ThreadSafeModule jl_create_ts_module(StringRef name, orc::ThreadSafe
 }
 
 void fixupTM(TargetMachine &TM) JL_NOTSAFEPOINT;
-
-void optimizeDLSyms(Module &M);
 
 static inline const char *jl_symbol_prefix(jl_symbol_prefix_t type,
                                            jl_invoke_api_t api) JL_NOTSAFEPOINT

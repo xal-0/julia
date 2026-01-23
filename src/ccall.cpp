@@ -808,6 +808,10 @@ static jl_cgval_t emit_cglobal(jl_codectx_t &ctx, jl_value_t **args, size_t narg
     if (sym.jl_ptr != NULL) {
         res = sym.jl_ptr;
     }
+    else if (!ctx.emission_context.imaging_mode && sym.f_name &&
+             (sym.f_lib || !sym.f_lib_expr)) {
+        res = ctx.emission_context.get_csymbol_target(sym.f_name, sym.f_lib, false);
+    }
     else if (sym.f_name_expr != NULL) {
         res = runtime_sym_lookup(ctx, sym, ctx.f);
     }
@@ -2241,6 +2245,10 @@ jl_cgval_t function_sig_t::emit_a_ccall(
         if (symarg.f_name == nullptr)
             emit_error(ctx, "ccall: Had name expression, but symbol lookup was disabled");
         llvmf = jl_Module->getOrInsertFunction(symarg.f_name, functype).getCallee();
+    }
+    else if (!ctx.emission_context.imaging_mode && symarg.f_name &&
+             (symarg.f_lib || !symarg.f_lib_expr)) {
+        llvmf = ctx.emission_context.get_csymbol_target(symarg.f_name, symarg.f_lib, true);
     }
     else {
         ++DeferredCCallLookups;
