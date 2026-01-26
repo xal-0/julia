@@ -25,6 +25,7 @@ struct JuliaTaskDispatcher : public TaskDispatcher {
     void dispatch(std::unique_ptr<Task> T) override;
     void shutdown() override;
     void work_until(future_base &F);
+    void enable_threads();
 
 protected:
   void process_tasks(jl_unique_gcsafe_lock &Lock) JL_NOTSAFEPOINT_ENTER JL_NOTSAFEPOINT_LEAVE;
@@ -36,6 +37,7 @@ private:
   SmallVector<std::unique_ptr<Task>> TaskQueue;
   std::mutex DispatchMutex;
   std::condition_variable WorkFinishedCV;
+  bool ThreadsEnabled = false;
 
 public:
 
@@ -338,6 +340,9 @@ private:
 }; // class JuliaTaskDispatcher
 
 void JuliaTaskDispatcher::dispatch(std::unique_ptr<Task> T) {
+  if (!ThreadsEnabled)
+    return T->run();
+
   std::unique_lock Lock{DispatchMutex};
   TaskQueue.push_back(std::move(T));
 }
@@ -372,6 +377,14 @@ void JuliaTaskDispatcher::process_tasks(jl_unique_gcsafe_lock &Lock) {
 
         WorkFinishedCV.notify_all();
     }
+}
+
+// This is a huge hack to make it so tasks execute in-place in
+// LazyReexportsManager's constructor, which does a lookup using an ordinary
+// std::future.  Once that's done we'll switch our scheduler back on.
+void JuliaTaskDispatcher::enable_threads()
+{
+    ThreadsEnabled = true;
 }
 
 } // End namespace

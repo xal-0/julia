@@ -13,9 +13,11 @@
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/PassTimingInfo.h>
 
+#include <llvm/ExecutionEngine/JITEventListener.h>
 #include <llvm/ExecutionEngine/Orc/IRCompileLayer.h>
 #include <llvm/ExecutionEngine/Orc/IRTransformLayer.h>
-#include <llvm/ExecutionEngine/JITEventListener.h>
+#include <llvm/ExecutionEngine/Orc/LazyReexports.h>
+#include <llvm/ExecutionEngine/Orc/RedirectionManager.h>
 
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/PassPlugin.h>
@@ -851,6 +853,8 @@ private:
     OptimizeLayerT OptimizeLayer;
     OptSelLayerT OptSelLayer;
     std::shared_ptr<JLDebuginfoPlugin> DebuginfoPlugin;
+    std::unique_ptr<orc::RedirectableSymbolManager> RedirMgr;
+    std::unique_ptr<orc::LazyReexportsManager> LazyMgr;
 };
 extern JuliaOJIT *jl_ExecutionEngine;
 

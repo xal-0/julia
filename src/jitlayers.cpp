@@ -43,8 +43,10 @@
 #include <llvm/Bitcode/BitcodeWriter.h>
 
 #include <llvm/ExecutionEngine/JITLink/JITLink.h>
-#include <llvm/ExecutionEngine/Orc/ObjectFileInterface.h>
 #include <llvm/ExecutionEngine/Orc/DebugUtils.h>
+#include <llvm/ExecutionEngine/Orc/JITLinkRedirectableSymbolManager.h>
+#include <llvm/ExecutionEngine/Orc/JITLinkReentryTrampolines.h>
+#include <llvm/ExecutionEngine/Orc/ObjectFileInterface.h>
 #include <llvm/Object/MachO.h>
 #include <llvm/Object/ObjectFile.h>
 
@@ -970,6 +972,50 @@ public:
     // During materializtion: finalizers disabled, GC safe
     void materialize(std::unique_ptr<MaterializationResponsibility> R) override
     {
+        // Before attempting to compile, check to see if a compatible specptr exists.
+        if (checkCompiled(*R, CI))
+            return;
+
+        jl_task_t *ct = jl_current_task;
+        uint8_t state = jl_gc_unsafe_enter(ct->ptls);
+        jl_code_instance_t *CI2 = jl_compile_method_internal(
+            jl_get_ci_mi(CI), jl_atomic_load_relaxed(&CI->min_world));
+        jl_gc_unsafe_leave(ct->ptls, state);
+
+        if (!checkCompiled(*R, CI2))
+            materializeTrampoline(*R);
+    }
+
+    StringRef getName() const override JL_NOTSAFEPOINT { return *Sym; }
+
+    void discard(const JITDylib &JD, const SymbolStringPtr &Name) override {}
+
+protected:
+    bool checkCompiled(MaterializationResponsibility &R, jl_code_instance_t *CI)
+    {
+        uint8_t Flags;
+        jl_callptr_t Invoke;
+        void *SpecPtr;
+        jl_read_codeinst_invoke(CI, &Flags, &Invoke, &SpecPtr, 0);
+
+        if (Flags & JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR) {
+            if (API == jl_callptr_invoke_api(Invoke))
+                cantFail(R.replace(orc::absoluteSymbols(
+                    {{JIT.mangle(*Sym),
+                      {ExecutorAddr::fromPtr(SpecPtr),
+                       JITSymbolFlags::Exported | JITSymbolFlags::Callable}}})));
+            else
+                materializeTrampoline(R);
+            return true;
+        }
+
+        return false;
+    }
+
+    void materializeTrampoline(MaterializationResponsibility &R)
+    {
+        // The codeinst was compiled, but the API is incompatbile.  We have no
+        // choice but to emit a trampoline.
         jl_codegen_output_t Out{*Sym, JIT.getDataLayout(), JIT.getTargetTriple()};
 
         jl_task_t *ct = jl_current_task;
@@ -980,20 +1026,15 @@ public:
         jl_gc_unsafe_leave(ct->ptls, state);
         F->setLinkage(GlobalValue::ExternalLinkage);
         F->setName(*Sym);
-
         std::unique_lock Lock{JIT.LinkerMutex};
-        if (auto Err = R->replace(
+        if (auto Err = R.replace(
                 std::make_unique<JLMaterializationUnit>(JLMaterializationUnit::Create(
                     JIT, OL,
-                    Out.finish(*R->getExecutionSession().getSymbolStringPool()))))) {
-            R->getExecutionSession().reportError(std::move(Err));
-            R->failMaterialization();
+                    Out.finish(*R.getExecutionSession().getSymbolStringPool()))))) {
+            R.getExecutionSession().reportError(std::move(Err));
+            R.failMaterialization();
         }
     }
-
-    StringRef getName() const override JL_NOTSAFEPOINT { return *Sym; }
-
-    void discard(const JITDylib &JD, const SymbolStringPtr &Name) override {}
 
 private:
     JuliaOJIT &JIT;
@@ -1002,6 +1043,35 @@ private:
     jl_code_instance_t *CI;
     jl_invoke_api_t API;
 };
+
+extern "C" void _orc_rt_sysv_reenter();
+static char _orc_rt_resolve_tag;
+
+extern "C" void *__orc_rt_resolve(void *Caller)
+{
+    auto &ES = jl_ExecutionEngine->getExecutionSession();
+    auto &D =
+        static_cast<JuliaTaskDispatcher &>(ES.getExecutorProcessControl().getDispatcher());
+
+    Expected<ExecutorSymbolDef> Result((ExecutorSymbolDef()));
+    if (auto Err = shared::WrapperFunction<
+            shared::SPSExpected<shared::SPSExecutorSymbolDef>(shared::SPSExecutorAddr)>::
+            call(
+                [&](const char *ArgData, size_t ArgSize) {
+                    JuliaTaskDispatcher::future<shared::WrapperFunctionResult> F;
+                    ES.runJITDispatchHandler(
+                        [P = F.get_promise()](shared::WrapperFunctionResult Result) {
+                            P.set_value(std::move(Result));
+                        },
+                        ExecutorAddr::fromPtr(&_orc_rt_resolve_tag), {ArgData, ArgSize});
+                    return F.get(D);
+                },
+                Result, ExecutorAddr::fromPtr(Caller)))
+        abort();
+
+
+    return Result->getAddress().toPtr<void *>();
+}
 
 class JLEHFrameRegistrar final : public jitlink::EHFrameRegistrar {
 public:
@@ -1692,7 +1762,8 @@ JuliaOJIT::JuliaOJIT()
     Optimizers(std::make_unique<OptimizerT>(*TM, PrintLLVMTimers, llvm_printing_mutex)),
     OptimizeLayer(ES, JITPointersLayer, IRTransformRef(*Optimizers)),
     OptSelLayer(ES, OptimizeLayer, static_cast<orc::ThreadSafeModule (*)(orc::ThreadSafeModule, orc::MaterializationResponsibility&)>(selectOptLevel)),
-    DebuginfoPlugin(std::make_shared<JLDebuginfoPlugin>())
+    DebuginfoPlugin(std::make_shared<JLDebuginfoPlugin>()),
+    RedirMgr(cantFail(orc::JITLinkRedirectableSymbolManager::Create(ObjectLayer)))
 {
 # if defined(LLVM_SHLIB)
     // When dynamically linking against LLVM, use our custom EH frame registration code
@@ -1758,6 +1829,18 @@ JuliaOJIT::JuliaOJIT()
     JD.addToLinkOrder(ExternalJD, orc::JITDylibLookupFlags::MatchExportedSymbolsOnly);
     ExternalJD.addToLinkOrder(GlobalJD, orc::JITDylibLookupFlags::MatchExportedSymbolsOnly);
     ExternalJD.addToLinkOrder(JD, orc::JITDylibLookupFlags::MatchExportedSymbolsOnly);
+
+    cantFail(GlobalJD.define(orc::absoluteSymbols(
+        {{ES.intern("__orc_rt_reenter"),
+          {ExecutorAddr::fromPtr((void *)_orc_rt_sysv_reenter), JITSymbolFlags::Exported}},
+         {ES.intern("__orc_rt_resolve_tag"),
+          {ExecutorAddr::fromPtr((void *)&_orc_rt_resolve_tag), JITSymbolFlags::Exported}}})));
+
+    LazyMgr = cantFail(
+        orc::createJITLinkLazyReexportsManager(ObjectLayer, *RedirMgr, GlobalJD));
+
+    static_cast<JuliaTaskDispatcher &>(ES.getExecutorProcessControl().getDispatcher())
+        .enable_threads();
 
     orc::SymbolAliasMap jl_crt = {
         // Float16 conversion routines
@@ -2225,8 +2308,10 @@ orc::SymbolStringPtr JuliaOJIT::linkCallTarget(orc::MaterializationResponsibilit
     // We also generate a tojlinvoke to handle args1 -> specsig.
     CISymbolPtr Trampoline;
     if (!Sym || Sym->invoke_api != API) {
-        auto TSym = ES.intern(Names("tojlinvoke#", name_from_method_instance(jl_get_ci_mi(CI)), "#"));
-        Trampoline.specptr = mangle(*TSym);
+        auto MIName = name_from_method_instance(jl_get_ci_mi(CI));
+        auto LSym = ES.intern(Names("lazy_tojlinvoke#", MIName, "#"));
+        auto TSym = ES.intern(Names("tojlinvoke#", MIName, "#"));
+        Trampoline.specptr = LSym;
         Trampoline.invoke_api = API;
         Sym = &Trampoline;
         auto Err = JD.define(std::make_unique<JLTrampolineMaterializationUnit>(
@@ -2235,6 +2320,16 @@ orc::SymbolStringPtr JuliaOJIT::linkCallTarget(orc::MaterializationResponsibilit
 #ifndef __clang_analyzer__ // reportError calls an arbitrary function, which the static analyzer thinks might be a safepoint
             MR.getExecutionSession().reportError(std::move(Err));
 #endif
+            MR.failMaterialization();
+            return {};
+        }
+
+        Err = JD.define(lazyReexports(
+            *LazyMgr,
+            {{LSym,
+              {mangle(*TSym), JITSymbolFlags::Exported | JITSymbolFlags::Callable}}}));
+        if (Err) {
+            MR.getExecutionSession().reportError(std::move(Err));
             MR.failMaterialization();
             return {};
         }

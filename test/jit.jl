@@ -54,6 +54,17 @@ ci = compile_no_deps(M2.bar, (Int,))
 @test check_edges_not_compiled(ci, M2.foo)
 @test invoke(M2.bar, ci, 5) == 210
 
+# Test lazy trampoline compilation
+module M3
+    @noinline foo1(x) = x+1
+    @noinline foo2(x) = x*2
+    bar(x, y) = x ? foo1(y) : foo2(y)
+end
+
+ci = compile_no_deps(M3.bar, (Bool, Int))
+@test check_edges_not_compiled(ci, M3.bar)
+@test invoke(M3.bar, ci, true, 1) == 2
+
 # Each `eval` must compile (because of the ccall) a top-level thunk.  The
 # CodeInstance for this thunk becomes garbage-collectable after being invoked,
 # but before returning, because of wait().  If the invoke must return for the
