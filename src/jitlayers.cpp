@@ -1069,7 +1069,8 @@ extern "C" void *__orc_rt_resolve(void *Caller)
                 Result, ExecutorAddr::fromPtr(Caller)))
         abort();
 
-
+    if (!Result)
+        abort();
     return Result->getAddress().toPtr<void *>();
 }
 
