@@ -442,8 +442,8 @@ jl_emit_codeinsts_to_jit_impl(jl_code_instance_t **codeinsts, jl_code_info_t **s
 {
     JL_TIMING(CODEINST_COMPILE, CODEINST_COMPILE);
 
-    jl_codegen_output_t out{"jit",
-                            jl_ExecutionEngine->getDataLayout(),
+    const char *name = name_from_method_instance(jl_get_ci_mi(codeinsts[len - 1]));
+    jl_codegen_output_t out{name, jl_ExecutionEngine->getDataLayout(),
                             jl_ExecutionEngine->getTargetTriple()};
     out.get_context().setDiscardValueNames(true);
     out.imaging_mode = false;
