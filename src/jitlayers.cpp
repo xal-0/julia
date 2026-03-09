@@ -440,8 +440,10 @@ static void jl_do_dump_compile(jl_code_instance_t *codeinst, uint64_t time)
 extern "C" JL_DLLEXPORT_CODEGEN void
 jl_emit_codeinsts_to_jit_impl(jl_code_instance_t **codeinsts, jl_code_info_t **srcs, int len)
 {
-    JL_TIMING(CODEINST_COMPILE, CODEINST_COMPILE);
+    if (len == 0)
+        return;
 
+    JL_TIMING(CODEINST_COMPILE, CODEINST_COMPILE);
     const char *name = name_from_method_instance(jl_get_ci_mi(codeinsts[len - 1]));
     jl_codegen_output_t out{name, jl_ExecutionEngine->getDataLayout(),
                             jl_ExecutionEngine->getTargetTriple()};
