@@ -459,8 +459,10 @@ jl_emit_codeinsts_to_jit_impl(jl_code_instance_t **codeinsts, jl_code_info_t **s
 
         out.temporary_roots = jl_alloc_array_1d(jl_array_any_type, 0);
         out.temporary_roots_set.clear();
-        if (!jl_emit_codeinst(out, codeinst, src)) // contains safepoints
-            continue;
+        if (!jl_emit_codeinst(out, codeinst, src)) { // contains safepoints
+            JL_GC_POP();
+            return;
+        }
 
         // contains safepoints
         jl_promote_method_roots(out, mi);
