@@ -43,6 +43,10 @@
 #include <llvm/Bitcode/BitcodeWriter.h>
 
 #include <llvm/ExecutionEngine/JITLink/JITLink.h>
+#if JL_LLVM_VERSION >= 210000
+#include <llvm/ExecutionEngine/JITLink/EHFrameSupport.h>
+#include <llvm/ExecutionEngine/Orc/Shared/WrapperFunctionUtils.h>
+#endif
 #include <llvm/ExecutionEngine/Orc/ObjectFileInterface.h>
 #include <llvm/ExecutionEngine/Orc/DebugUtils.h>
 #include <llvm/Object/MachO.h>
@@ -1003,6 +1007,8 @@ private:
     jl_invoke_api_t API;
 };
 
+#if defined(LLVM_SHLIB)
+#if JL_LLVM_VERSION < 210000
 class JLEHFrameRegistrar final : public jitlink::EHFrameRegistrar {
 public:
     Error registerEHFrames(orc::ExecutorAddrRange EHFrameSection) override {
@@ -1015,6 +1021,72 @@ public:
         return Error::success();
     }
 };
+#else
+class JLEHFrameRegistrationPlugin final : public LinkGraphLinkingLayer::Plugin {
+    static Error registerEHFrameWrapper(orc::ExecutorAddrRange EHFrame) {
+        register_eh_frames(EHFrame.Start.toPtr<uint8_t *>(), static_cast<size_t>(EHFrame.size()));
+        return Error::success();
+    }
+
+    static Error deregisterEHFrameWrapper(orc::ExecutorAddrRange EHFrame) {
+        deregister_eh_frames(EHFrame.Start.toPtr<uint8_t *>(), static_cast<size_t>(EHFrame.size()));
+        return Error::success();
+    }
+
+    static orc::shared::CWrapperFunctionResult
+    registerEHFrameSectionAllocAction(const char *ArgData, size_t ArgSize) {
+        using namespace llvm::orc::shared;
+        return WrapperFunction<SPSError(SPSExecutorAddrRange)>::handle(
+            ArgData, ArgSize, registerEHFrameWrapper)
+            .release();
+    }
+
+    static orc::shared::CWrapperFunctionResult
+    deregisterEHFrameSectionAllocAction(const char *ArgData, size_t ArgSize) {
+        using namespace llvm::orc::shared;
+        return WrapperFunction<SPSError(SPSExecutorAddrRange)>::handle(
+            ArgData, ArgSize, deregisterEHFrameWrapper)
+            .release();
+    }
+
+    static Error postFixup(jitlink::LinkGraph &G)
+    {
+        using namespace llvm::orc::shared;
+        auto registerFrame = ExecutorAddr::fromPtr(registerEHFrameSectionAllocAction);
+        auto deregisterFrame = ExecutorAddr::fromPtr(deregisterEHFrameSectionAllocAction);
+        if (auto *EHFrame = jitlink::getEHFrameSection(G)) {
+            auto R = jitlink::SectionRange(*EHFrame).getRange();
+            G.allocActions().push_back(
+                {cantFail(
+                        WrapperFunctionCall::Create<SPSArgList<SPSExecutorAddrRange>>(
+                            registerFrame, R)),
+                 cantFail(
+                     WrapperFunctionCall::Create<SPSArgList<SPSExecutorAddrRange>>(
+                         deregisterFrame, R))});
+        }
+        return Error::success();
+    }
+
+public:
+    JLEHFrameRegistrationPlugin() {}
+
+    void modifyPassConfig(MaterializationResponsibility&,
+                          jitlink::LinkGraph&,
+                          jitlink::PassConfiguration &PassConfig) override
+    {
+        PassConfig.PostFixupPasses.push_back(postFixup);
+    }
+    Error notifyFailed(MaterializationResponsibility&) override {
+        return Error::success();
+    }
+    Error notifyRemovingResources(JITDylib&, ResourceKey) override {
+        return Error::success();
+    }
+    void notifyTransferringResources(JITDylib&, ResourceKey,
+                                     ResourceKey) override {}
+};
+#endif
+#endif
 
 RTDyldMemoryManager *createRTDyldMemoryManager(void) JL_NOTSAFEPOINT;
 std::unique_ptr<jitlink::JITLinkMemoryManager> createJITLinkMemoryManager() JL_NOTSAFEPOINT;
@@ -1694,6 +1766,7 @@ JuliaOJIT::JuliaOJIT()
     OptSelLayer(ES, OptimizeLayer, static_cast<orc::ThreadSafeModule (*)(orc::ThreadSafeModule, orc::MaterializationResponsibility&)>(selectOptLevel)),
     DebuginfoPlugin(std::make_shared<JLDebuginfoPlugin>())
 {
+#if JL_LLVM_VERSION < 210000
 # if defined(LLVM_SHLIB)
     // When dynamically linking against LLVM, use our custom EH frame registration code
     // also used with RTDyld to inform both our and the libc copy of libunwind.
@@ -1703,6 +1776,14 @@ JuliaOJIT::JuliaOJIT()
 # endif
     ObjectLayer.addPlugin(std::make_unique<EHFrameRegistrationPlugin>(
         ES, std::move(ehRegistrar)));
+#else
+    // LLVM 21+ removed EHFrameRegistrar. Use our own plugin for custom registration
+    // when dynamically linking, plus the built-in plugin for standard registration.
+# if defined(LLVM_SHLIB)
+    ObjectLayer.addPlugin(std::make_unique<JLEHFrameRegistrationPlugin>());
+# endif
+    ObjectLayer.addPlugin(cantFail(EHFrameRegistrationPlugin::Create(ES)));
+#endif
 
     ObjectLayer.addPlugin(DebuginfoPlugin);
     ObjectLayer.addPlugin(std::make_unique<JLMemoryUsagePlugin>(&jit_bytes_size));
