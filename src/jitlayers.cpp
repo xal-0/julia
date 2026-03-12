@@ -285,6 +285,18 @@ StringRef jl_codegen_output_t::get_call_target(jl_code_instance_t *ci, bool spec
     return target.decl->getName();
 }
 
+Function *jl_codegen_output_t::get_ccall_target(const char *f_name, void *f_lib)
+{
+    assert(f_name);
+    auto &f = ccall_targets[{f_name, f_lib}];
+    if (f)
+        return f;
+    std::string name = names(f_name, "_");
+    auto fty = FunctionType::get(Type::getVoidTy(get_context()), false);
+    f = Function::Create(fty, Function::ExternalLinkage, name, get_module());
+    return f;
+}
+
 jl_emitted_output_t jl_codegen_output_t::finish(std::unique_ptr<LLVMContext> ctx,
                                                 std::unique_ptr<Module> mod,
                                                 orc::SymbolStringPool &SSP)
@@ -305,9 +317,10 @@ jl_emitted_output_t jl_codegen_output_t::finish(std::unique_ptr<LLVMContext> ctx
     }
     for (auto &[call, target] : call_targets)
         info->call_targets[call] = intern(target.decl->getName());
-    for (auto [val, gv] : global_targets) {
+    for (auto [val, gv] : global_targets)
         info->global_targets[val] = intern(gv->getName());
-    }
+    for (auto [func, target] : ccall_targets)
+        info->ccall_targets[func] = intern(target->getName());
 
     return {std::move(ctx), std::move(mod), std::move(info)};
 }
