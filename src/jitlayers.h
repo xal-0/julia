@@ -13,9 +13,10 @@
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/PassTimingInfo.h>
 
+#include <llvm/ExecutionEngine/JITEventListener.h>
 #include <llvm/ExecutionEngine/Orc/IRCompileLayer.h>
 #include <llvm/ExecutionEngine/Orc/IRTransformLayer.h>
-#include <llvm/ExecutionEngine/JITEventListener.h>
+#include <llvm/ExecutionEngine/Orc/RedirectionManager.h>
 
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/PassPlugin.h>
@@ -28,6 +29,7 @@
 #include "platform.h"
 #include "llvm-codegen-shared.h"
 #include "llvm-version.h"
+#include "llvm-lazyreexports.h"
 #include <stack>
 #include <queue>
 #include <tuple>
@@ -326,7 +328,7 @@ struct jl_ccall_spec_t {
 };
 
 template<>
-struct DenseMapInfo<jl_ccall_spec_t> {
+struct llvm::DenseMapInfo<jl_ccall_spec_t> {
     using T = std::pair<const char *, void *>;
     using I = DenseMapInfo<T>;
     static inline jl_ccall_spec_t from(T t) { return {t.first, t.second}; }
@@ -841,6 +843,9 @@ protected:
                                         jl_code_instance_t *CI,
                                         jl_invoke_api_t API) JL_NOTSAFEPOINT;
 
+    orc::SymbolStringPtr linkCCall(orc::MaterializationResponsibility &MR,
+                                   jl_ccall_spec_t CCall);
+
     // If the provided CodeInstance is neither compiled nor has an ORC symbol in
     // CISymbols, look for a compatible CodeInstance in the MethodInstance's
     // cache that does.  Returns the original CodeInstance if none exists.
@@ -894,6 +899,8 @@ private:
     std::unique_ptr<OptimizerT> Optimizers;
     OptimizeLayerT OptimizeLayer;
     std::shared_ptr<JLDebuginfoPlugin> DebuginfoPlugin;
+    std::unique_ptr<julia::RedirectableSymbolManager> RedirMgr;
+    std::unique_ptr<julia::LazyReexportsManager> LazyMgr;
 };
 extern JuliaOJIT *jl_ExecutionEngine;
 

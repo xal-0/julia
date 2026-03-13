@@ -14,6 +14,7 @@
 #include <llvm/ExecutionEngine/Orc/CompileUtils.h>
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
 #include <llvm/ExecutionEngine/Orc/DebugObjectManagerPlugin.h>
+#include <llvm/ExecutionEngine/Orc/JITLinkRedirectableSymbolManager.h>
 #if JL_LLVM_VERSION >= 210000
 #  include <llvm/ExecutionEngine/Orc/SelfExecutorProcessControl.h>
 #endif
@@ -1588,45 +1589,6 @@ struct JuliaOJIT::DLSymOptimizer {
     }
 
     void operator()(Module &M) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER {
-        for (auto &GV : M.globals()) {
-            auto Name = GV.getName();
-            if (Name.starts_with("jlplt") && Name.ends_with("got")) {
-                auto fname = GV.getAttribute("julia.fname").getValueAsString().str();
-                void *addr;
-                if (GV.hasAttribute("julia.libname")) {
-                    auto libname = GV.getAttribute("julia.libname").getValueAsString().str();
-                    addr = lookup(libname.data(), fname.data());
-                } else {
-                    assert(GV.hasAttribute("julia.libidx") && "PLT entry should have either libname or libidx attribute!");
-                    auto libidx = (uintptr_t)std::stoull(GV.getAttribute("julia.libidx").getValueAsString().str());
-                    addr = lookup(libidx, fname.data());
-                }
-                if (addr) {
-                    Function *Thunk = nullptr;
-                    if (!GV.isDeclaration()) {
-                        Thunk = cast<Function>(GV.getInitializer()->stripPointerCasts());
-                        assert(++Thunk->uses().begin() == Thunk->uses().end() && "Thunk should only have one use in PLT initializer!");
-                        assert(Thunk->hasLocalLinkage() && "Thunk should not have non-local linkage!");
-                    }
-                    else {
-                        GV.setLinkage(GlobalValue::PrivateLinkage);
-                    }
-                    auto init = ConstantExpr::getIntToPtr(ConstantInt::get(M.getDataLayout().getIntPtrType(M.getContext()), (uintptr_t)addr), GV.getValueType());
-                    if (named) {
-                        auto T = GV.getValueType();
-                        assert(T->isPointerTy());
-                        init = GlobalAlias::create(T, 0, GlobalValue::PrivateLinkage, GV.getName() + ".jit", init, &M);
-                    }
-                    GV.setInitializer(init);
-                    GV.setConstant(true);
-                    GV.setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
-                    if (Thunk) {
-                        Thunk->eraseFromParent();
-                    }
-                }
-            }
-        }
-
         for (auto &F : M) {
             for (auto &BB : F) {
                 SmallVector<Instruction *, 0> to_delete;
@@ -1715,6 +1677,9 @@ llvm::DataLayout jl_create_datalayout(TargetMachine &TM) {
     return jl_data_layout;
 }
 
+extern "C" void __orc_rt_sysv_reenter();
+extern "C" char __orc_rt_jl_resolve_tag;
+
 JuliaOJIT::JuliaOJIT()
   : TM(createTargetMachine()),
     DL(jl_create_datalayout(*TM)),
@@ -1756,6 +1721,27 @@ JuliaOJIT::JuliaOJIT()
     ObjectLayer.addPlugin(DebuginfoPlugin);
     ObjectLayer.addPlugin(std::make_unique<JLMemoryUsagePlugin>(&jit_bytes_size));
 
+#ifdef _CPU_AARCH64_
+    {
+        auto RM = julia::JITLinkRedirectableSymbolManager::Create(ObjectLayer);
+        RedirMgr = RM.takeError() ? nullptr : std::move(*RM);
+        if (RedirMgr) {
+            cantFail(JD.define(
+                absoluteSymbols({{ES.intern("__orc_rt_reenter"),
+                                  {ExecutorAddr::fromPtr(&__orc_rt_sysv_reenter),
+                                   JITSymbolFlags::Callable | JITSymbolFlags::Exported}},
+                                 {ES.intern("__orc_rt_jl_resolve_tag"),
+                                  {ExecutorAddr::fromPtr(&__orc_rt_jl_resolve_tag),
+                                   JITSymbolFlags::Exported}}})));
+            auto LM = julia::createJITLinkLazyReexportsManager(ObjectLayer, *RedirMgr, JD);
+            LazyMgr = LM.takeError() ? nullptr : std::move(*LM);
+        }
+    }
+#endif
+
+    auto &TD = (JuliaTaskDispatcher &)ES.getExecutorProcessControl().getDispatcher();
+    TD.defer = true;
+
     std::string ErrorStr;
 
     // Make sure that libjulia-internal is loaded and placed first in the
@@ -1773,15 +1759,9 @@ JuliaOJIT::JuliaOJIT()
     if (sys::DynamicLibrary::LoadLibraryPermanently(nullptr, &ErrorStr))
         report_fatal_error(llvm::Twine("FATAL: unable to dlopen self\n") + ErrorStr);
 
-    GlobalJD.addGenerator(
-      std::make_unique<orc::DynamicLibrarySearchGenerator>(
-        libjulia_internal_dylib,
-        DL.getGlobalPrefix(),
-        orc::DynamicLibrarySearchGenerator::SymbolPredicate()));
-
-    GlobalJD.addGenerator(
-      cantFail(orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
-        DL.getGlobalPrefix())));
+    // This resolves symbols generated by codegen, but not Julia ccalls.
+    GlobalJD.addGenerator(std::make_unique<orc::DynamicLibrarySearchGenerator>(
+        libjulia_internal_dylib, DL.getGlobalPrefix()));
 
     // Resolve non-lock free atomic functions in the libatomic1 library.
     // This is the library that provides support for c11/c++11 atomic operations.
@@ -2242,6 +2222,15 @@ bool JuliaOJIT::linkOutput(orc::MaterializationResponsibility &MR, MemoryBufferR
         Syms.at(T)->setName(Dest);
     }
 
+    // For every CCall, link it to an existing symbol in the JIT or add an MU
+    // that will dlsym it or generate a thunk.
+    for (auto &[CCall, T] : Info->ccall_targets) {
+        auto It = Syms.find(T);
+        if (It == Syms.end())
+            continue;
+        It->second->setName(linkCCall(MR, CCall));
+    }
+
     // Rename globals and add mappings
     // TODO: don't leak when we have a way to GC code
 #ifdef __clang_analyzer__
@@ -2304,6 +2293,56 @@ orc::SymbolStringPtr JuliaOJIT::linkCallTarget(orc::MaterializationResponsibilit
 
     assert(Sym->invoke_api == API);
     return Sym->specptr;
+}
+
+static bool ccall_lookup(jl_ccall_spec_t spec, void *&addr, bool throw_err)
+{
+    void *l = jl_get_library_((const char *)spec.lib, throw_err);
+    if (!l)
+        return false;
+    if (!jl_dlsym(l, spec.func, &addr, throw_err, 1))
+        return false;
+    return true;
+}
+
+orc::SymbolStringPtr JuliaOJIT::linkCCall(orc::MaterializationResponsibility &MR,
+                                          jl_ccall_spec_t CCall)
+{
+    SymbolStringPtr &Sym = CCallSymbols[CCall];
+    if (Sym)
+        return Sym;
+    Sym = ES.intern(Names("ccall_", CCall.func, "#"));
+
+    void *Addr;
+    if (ccall_lookup(CCall, Addr, false)) {
+        cantFail(JD.define(
+            absoluteSymbols({{Sym,
+                              {ExecutorAddr::fromPtr(Addr),
+                               JITSymbolFlags::Exported | JITSymbolFlags::Callable}}})));
+        return Sym;
+    }
+
+    auto ResolveCCall = [this, CCall]() {
+        void *Addr;
+        bool Ret = ccall_lookup(CCall, Addr, true);
+        (void)Ret;
+        assert(Ret);
+        auto Sym2 = ES.intern(Names("ccall_resolved_", CCall.func, "#"));
+        cantFail(JD.define(absoluteSymbols({{Sym2,
+                                             {ExecutorAddr::fromPtr(Addr),
+                                              JITSymbolFlags::Exported | JITSymbolFlags::Callable}}})));
+        {
+            std::unique_lock Lock{LinkerMutex};
+            CCallSymbols[CCall] = Sym2;
+        }
+        return Sym2;
+    };
+    auto MU = julia::lazyReexports(
+                                   *LazyMgr,
+                                   {{Sym, {JITSymbolFlags::Exported | JITSymbolFlags::Callable, ResolveCCall}}});
+    cantFail(JD.define(std::move(MU)));
+
+    return Sym;
 }
 
 jl_code_instance_t *JuliaOJIT::findCompatibleCI(jl_code_instance_t *CI)
@@ -2547,4 +2586,20 @@ extern "C" JL_DLLEXPORT_CODEGEN
 void jl_jit_unregister_ci_impl(jl_code_instance_t *ci)
 {
     jl_ExecutionEngine->unregisterCI(ci);
+}
+
+shared::CWrapperFunctionResult jl_orc_jitdispatch(const void *FnTag, const char *Data,
+                                                  size_t Size)
+{
+    auto &ES = jl_ExecutionEngine->getExecutionSession();
+    JuliaTaskDispatcher::future<shared::WrapperFunctionResult> F;
+    ES.runJITDispatchHandler(
+        [P = F.get_promise()](shared::WrapperFunctionResult Result) mutable {
+            P.set_value(std::move(Result));
+        },
+        ExecutorAddr::fromPtr(FnTag), {Data, Size});
+    return F
+        .get(static_cast<JuliaTaskDispatcher &>(
+            ES.getExecutorProcessControl().getDispatcher()))
+        .release();
 }
