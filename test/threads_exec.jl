@@ -1722,6 +1722,8 @@ end
     end
 end
 
+include("threads_comprehensions.jl")
+
 # This test is designed to trigger the performance regression from #60241:
 #   Thread 1                           Thread 2
 #   --------                           --------
