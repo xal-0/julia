@@ -3585,6 +3585,9 @@ function _collect_struct_fields(ctx, field_names, field_types, field_attrs, fiel
                     push!(field_docs, @ast ctx e n::K"Integer")
                     push!(field_docs, @ast ctx e m.docs)
                 end
+            elseif kind(e) == K"string" || is_effect_free(e)
+                # effect-free code and docstrings should not add to `defs`, since
+                # that would prevent inner ctors from being generated
             else
                 # Inner constructors and inner functions
                 # TODO: Disallow arbitrary expressions inside `struct`?
