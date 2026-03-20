@@ -224,7 +224,7 @@ vst1(vcx::Validation1Context, st::SyntaxTree)::ValidationResult = @stm st begin
     [K".&&" x y] -> vst1(vcx, x) & vst1(vcx, y)
     [K".||" x y] -> vst1(vcx, x) & vst1(vcx, y)
     (_, when=(vr=vst1_arraylike(vcx, st); is_known(vr))) -> vr
-    # syntax TODO: disallowpre-desugared const, broken with complex rhs
+    # syntax TODO: disallow pre-desugared const, broken with complex rhs
     [K"const" l r] -> vst1_ident(vcx, l; lhs=true) & vst1(vcx, r)
     [K"const" [K"global" x]] -> !vcx.toplevel ?
         @fail(st, "unsupported `const` inside function") :
@@ -562,10 +562,11 @@ vst1_call_arg(vcx, st) = @stm st begin
 end
 
 # Arg to `parameters` (post-semicolon) in a call (not function decl).  Stricter
-# than `vst1_call_arg`.
+# than `vst1_call_arg`.  `=` desugars to `kw`.
 vst1_call_kwarg(vcx, st) = @stm st begin
     [K"Identifier"] -> pass()
     [K"kw" id val] -> vst1_ident(vcx, id; lhs=true) & vst1(vcx, val)
+    [K"=" id val] -> vst1_ident(vcx, id; lhs=true) & vst1(vcx, val)
     [K"..." x] -> vst1(vcx, x)
     [K"." x [K"inert" id]] -> vst1(vcx, x) & vst1_ident(vcx, id; lhs=true)
     ([K"call" [K"Identifier"] symval v], when=(st[1].name_val==="=>")) ->

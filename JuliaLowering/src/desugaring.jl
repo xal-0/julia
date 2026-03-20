@@ -1626,8 +1626,7 @@ function _merge_named_tuple(ctx, srcref, old, new)
     end
 end
 
-function expand_named_tuple(ctx, ex, kws, eq_is_kw;
-                            field_name="named tuple field",
+function expand_named_tuple(ctx, ex, kws; field_name="named tuple field",
                             element_name="named tuple element")
     name_strs = Set{String}()
     names = SyntaxList(ctx)
@@ -1641,7 +1640,7 @@ function expand_named_tuple(ctx, ex, kws, eq_is_kw;
             # x  ==>  x = x
             name = to_symbol(ctx, kw)
             value = kw
-        elseif k == K"kw" || (eq_is_kw && k == K"=")
+        elseif k == K"kw" || k == K"="
             # syntax TODO: This should parse to K"kw"
             # x = a
             if kind(kw[1]) != K"Identifier" && kind(kw[1]) != K"Placeholder"
@@ -1710,7 +1709,7 @@ end
 function expand_kw_call(ctx, srcref, farg, args, kws)
     @ast ctx srcref [K"block"
         func := farg
-        kw_container := expand_named_tuple(ctx, srcref, kws, false;
+        kw_container := expand_named_tuple(ctx, srcref, kws;
                                            field_name="keyword argument",
                                            element_name="keyword argument")
         if all(kind(kw) == K"..." for kw in kws)
@@ -4789,9 +4788,9 @@ function expand_forms_2(ctx::DesugaringContext, ex::SyntaxTree, docs=nothing)
             if numchildren(ex) > 1
                 throw(LoweringError(ex[end], "unexpected semicolon in tuple - use `,` to separate tuple elements"))
             end
-            expand_forms_2(ctx, expand_named_tuple(ctx, ex, children(ex[1]), true))
+            expand_forms_2(ctx, expand_named_tuple(ctx, ex, children(ex[1])))
         elseif any_assignment(children(ex))
-            expand_forms_2(ctx, expand_named_tuple(ctx, ex, children(ex), true))
+            expand_forms_2(ctx, expand_named_tuple(ctx, ex, children(ex)))
         else
             expand_forms_2(ctx, @ast ctx ex [K"call"
                 "tuple"::K"core"
