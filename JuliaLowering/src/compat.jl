@@ -291,9 +291,7 @@ end
 
 function _est_to_dst_ident(st::SyntaxTree)
     s = st.name_val
-    if s in ("ccall", "cglobal")
-        setattr!(newleaf(st._graph, st, K"core"), :name_val, st.name_val)
-    elseif all(==('_'), s) || s == UNUSED
+    if all(==('_'), s) || s == UNUSED
         setattr!(mkleaf(st), :kind, K"Placeholder")
     else
         st

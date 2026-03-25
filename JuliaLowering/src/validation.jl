@@ -84,7 +84,9 @@ Base.@kwdef struct Validation1Context <: ValidationContext
     # fixme: flisp happens to allow reading of underscore vars if they are
     # introduced like `(function (where (call f (:: arg T)...) _) body)`, and
     # the underscore is used in T.  See #60626.
-    in_param_t::Bool=false
+    #
+    # Mod._ is also readable
+    readable_underscore::Bool=false
 
     # vst0 shares this context type since macro expansion doesn't recurse
     # into some forms, and most parts of the AST are the same.
@@ -98,11 +100,11 @@ function with(vcx::Validation1Context;
               in_symblock  =vcx.in_symblock,
               inner_cond   =vcx.inner_cond,
               return_ok    =vcx.return_ok,
-              in_param_t   =vcx.in_param_t,
+              readable_underscore=vcx.readable_underscore,
               unexpanded   =vcx.unexpanded)
     Validation1Context(
         toplevel, in_gscope, in_loop, in_symblock, inner_cond, return_ok,
-        in_param_t, unexpanded)
+        readable_underscore, unexpanded)
 end
 
 """
@@ -169,7 +171,7 @@ vst1(vcx::Validation1Context, st::SyntaxTree)::ValidationResult = @stm st begin
     [K"=" _...] -> vst1_assign(vcx, st)
     (_, when=(vr=vst1_dotted_or_op_assign(vcx, st); is_known(vr))) -> vr
     ([K"." l r], when=kind(r)!==K"tuple") ->
-        vst1(vcx, l) & vst1_simple_dot_rhs(vcx, r)
+        vst1(vcx, l) & vst1_simple_dot_rhs(vcx, r; lhs=false)
     [K"." x] ->
         vst1(vcx, x) # BroadcastFunction(x)
     [K"return" val] -> vcx.return_ok ?
@@ -497,11 +499,13 @@ end
 
 # syntax TODO: all-underscore variables may be read from with dot syntax
 # syntax TODO: disallow string
-vst1_simple_dot_rhs(vcx, st; lhs=true) = @stm st begin
+vst1_simple_dot_rhs(vcx, st; lhs) = @stm st begin
     [K"inert" x] -> vst1_simple_dot_rhs(vcx, x; lhs)
-    [K"Identifier"] -> vst1_ident(vcx, st; lhs)
-    [K"Value"] -> vst1_ident(vcx, st; lhs)
-    [K"String"] -> pass()
+    [K"Identifier"] -> vst1_ident(with(vcx; readable_underscore=true), st; lhs)
+    ([K"Value"], when=st.value isa String) ->
+        _ident_str(with(vcx; readable_underscore=true), st, st.value; lhs)
+    [K"String"] ->
+        _ident_str(with(vcx; readable_underscore=true), st, st.value; lhs)
     [K"tuple" _...] -> @fail(st, "dotcall syntax not valid here")
     _ -> @fail(st, "invalid `.` syntax")
 end
@@ -517,17 +521,20 @@ vst1_symdecl(vcx, st) = @stm st begin
 end
 
 # TODO: globalref might not be valid everywhere; check usage of this function
-vst1_ident(vcx, st; lhs=false, ccall_ok=false) = @stm st begin
-    ([K"Identifier"], when=(s=st.name_val; true)) -> if all(==('_'), s)
-        lhs || vcx.in_param_t ? pass() :
-            @fail(st, "all-underscore identifiers are write-only and their values cannot be used in expressions")
-    elseif !ccall_ok && s in ("ccall", "cglobal")
+vst1_ident(vcx, st; lhs=false) = @stm st begin
+    [K"Identifier"] -> _ident_str(vcx, st, st.name_val; lhs)
+    ([K"Value"], when=(st.value isa GlobalRef)) ->
+        _ident_str(vcx, st, string(st.value.name); lhs)
+    _ -> @fail(st, "expected identifier")
+end
+function _ident_str(vcx, st, s::String; lhs=false)
+    if !lhs && all(==('_'), s) && !vcx.readable_underscore
+        @fail(st, "all-underscore identifiers are write-only and their values cannot be used in expressions")
+    elseif lhs && s in ("ccall", "cglobal")
         @fail(st, string(s, " is a reserved identifier"))
     else
         pass()
     end
-    ([K"Value"], when=(st.value isa GlobalRef)) -> pass()
-    _ -> @fail(st, "expected identifier")
 end
 
 vst1_call(vcx, st) = @stm st begin
@@ -536,11 +543,11 @@ vst1_call(vcx, st) = @stm st begin
             @fail(st, "cglobal must have one or two arguments")) &
         all(vst1_call_arg, vcx, args)
     [K"call" f [K"parameters" kwargs...] args...] ->
-        (vst1_ident(vcx, f; ccall_ok=true) | vst1(vcx, f)) &
+        (vst1_ident(vcx, f) | vst1(vcx, f)) &
         all(vst1_call_arg, vcx, args) &
         all(vst1_call_kwarg, vcx, kwargs)
     [K"call" f args...] ->
-        (vst1_ident(vcx, f; ccall_ok=true) | vst1(vcx, f)) &
+        (vst1_ident(vcx, f) | vst1(vcx, f)) &
         all(vst1_call_arg, vcx, args)
     [K"call" _...] -> @fail(st, "malformed `call`")
     _ -> unknown()
@@ -635,7 +642,7 @@ vst1_function_calldecl(vcx, st) = @stm st begin
         vst1_function_calldecl(vcx, callex) & all(vst1_typevar_decl, vcx, tds)
     [K"::" callex rt] ->
         vst1_simple_calldecl(vcx, callex) &
-        vst1(with(vcx, in_param_t=true), rt)
+        vst1(with(vcx, readable_underscore=true), rt)
     _ -> vst1_simple_calldecl(vcx, st)
 end
 
@@ -669,9 +676,8 @@ vst1_macro(vcx, st) = @stm st begin
 end
 
 vst1_macro_calldecl_name(vcx, st) = @stm st begin
-    (_, when=vst1_ident(vcx, st).ok) -> pass()
     [K"." _ _] -> vst1_calldecl_dot_name(vcx, st)
-    _ -> @fail(st, "invalid macro name")
+    _ -> @fail(st, "invalid macro name") | vst1_ident(vcx, st; lhs=true)
 end
 
 vst1_calldecl_name(vcx, st) = @stm st begin
@@ -690,7 +696,7 @@ vst1_calldecl_name(vcx, st) = @stm st begin
 
     [K"where" t tds...] ->
         vst1_calldecl_name(vcx, t) & all(vst1_typevar_decl, vcx, tds)
-    _ -> @fail(st, "invalid function name") | vst1_ident(vcx, st)
+    _ -> @fail(st, "invalid function name") | vst1_ident(vcx, st; lhs=true)
 end
 
 # Check mandatory and optional positional params:
@@ -747,7 +753,7 @@ end
 vst1_pparam_typed_tuple(vcx, st) = @stm st begin
     [K"::" [K"tuple" _...] t] ->
         vst1_pparam_simple_tuple(vcx, st[1]) &
-        vst1(with(vcx; in_param_t=true), t)
+        vst1(with(vcx; readable_underscore=true), t)
     [K"tuple" _...] -> vst1_pparam_simple_tuple(vcx, st)
     _ -> vst1_param(vcx, st)
 end
@@ -772,8 +778,8 @@ end
 
 vst1_param(vcx, st) = @stm st begin
     [K"Identifier"] -> pass()
-    [K"::" [K"Identifier"] t] -> vst1(with(vcx; in_param_t=true), t)
-    [K"::" t] -> vst1(with(vcx; in_param_t=true), t)
+    [K"::" [K"Identifier"] t] -> vst1(with(vcx; readable_underscore=true), t)
+    [K"::" t] -> vst1(with(vcx; readable_underscore=true), t)
     _ -> @fail(st, "expected identifier or `identifier::type`")
 end
 
@@ -923,7 +929,6 @@ vst1_assign_lhs(vcx, st; in_const=false, in_tuple=false) = @stm st begin
     _ -> vst1_assign_lhs_nontuple(vcx, st; in_const)
 end
 vst1_assign_lhs_nontuple(vcx, st; in_const=false, in_tuple=false) = @stm st begin
-    [K"Identifier"] -> pass()
     [K"ssavalue" [K"Value"]] -> in_const ? @fail(st, "cannot declare ssavalue const") : pass()
     ([K"Value"], when=(st.value isa GlobalRef)) -> pass()
     (_, when=(is_eventually_call(st))) ->
@@ -947,7 +952,8 @@ vst1_assign_lhs_nontuple(vcx, st; in_const=false, in_tuple=false) = @stm st begi
         @fail(st, "unexpected `;` in left side of indexed assignment")
     (_, when=(kind(st) in KSet"vect hcat vcat ncat")) ->
         @fail(st, "use `(a, b) = ...` to assign multiple values")
-    _ -> @fail(st, "invalid syntax in left-hand side of assignment")
+    _ -> @fail(st, "invalid syntax in left-hand side of assignment") |
+        vst1_ident(vcx, st; lhs=true)
 end
 
 vst1_dotassign_lhs(vcx, st) = vst1_assign_lhs(vcx, st) | vst1(vcx, st)
@@ -1176,6 +1182,8 @@ vst2(vcx::Validation2Context, st::SyntaxTree) = @stm st begin
     latestworld latestworld_if_toplevel symbolicgoto symboliclabel TOMBSTONE
     """ ? pass() : @fail(st, "unrecognized leaf kind")
 
+    [K"call" [K"static_eval" cg] xs...] -> get(cg, :name_val, nothing) == "cglobal" ?
+        all(vst2, vcx, xs) : @fail(st, "expected (call (static_eval cglobal) _...)")
     [K"call" xs...] -> all(vst2, vcx, xs)
     [K"block" xs...] -> all(vst2, vcx, xs)
     [K"scope_block" xs...] -> all(vst2, vcx, xs)

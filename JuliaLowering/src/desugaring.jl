@@ -1733,7 +1733,7 @@ function expand_C_library_symbol(ctx, ex)
 end
 
 function expand_ccall(ctx, ex)
-    @jl_assert kind(ex) == K"call" && is_core_ref(ex[1], "ccall") ex
+    @jl_assert kind(ex) == K"call" ex
     if numchildren(ex) < 4
         throw(LoweringError(ex, "too few arguments to ccall"))
     end
@@ -1908,12 +1908,11 @@ end
 
 function expand_call(ctx, ex)
     farg = ex[1]
-    if is_core_ref(farg, "ccall")
+    if kind(farg) === K"Identifier" && farg.name_val === "ccall"
         return expand_ccall(ctx, ex)
-    elseif is_core_ref(farg, "cglobal")
-        @jl_assert numchildren(ex) in 2:3  (ex, "cglobal must have one or two arguments")
+    elseif kind(farg) === K"Identifier" && farg.name_val === "cglobal"
         return @ast ctx ex [K"call"
-            ex[1]
+            [K"static_eval" ex[1]] # just so the globalref is inlined
             expand_forms_2(ctx, ex[2])
             if numchildren(ex) == 3
                 expand_forms_2(ctx, ex[3])
@@ -2798,8 +2797,6 @@ function expand_function_arg1(ctx, arg)
         _ -> newsym(ctx, arg, "#self#")
     end
     atype = @stm arg begin
-        [K"curly" _ _...] -> @ast ctx arg [K"function_type" arg]
-        [K"where" _ _...] -> @ast ctx arg [K"function_type" arg]
         [K"::" t] -> t
         [K"::" _ t] -> t
         _ -> @ast ctx arg [K"function_type" arg]

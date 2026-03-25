@@ -355,7 +355,7 @@ function set_scope_layer(ctx, ex, layer_id, force)
 
     ex2 = if k == K"module" || k == K"toplevel" || k == K"inert" || k == K"inert_syntaxtree"
         mknode(ex, children(ex))
-    elseif k == K"."
+    elseif k == K"." && numchildren(ex) == 2
         cs = tree_ids(set_scope_layer(ctx, ex[1], layer_id, force), ex[2])
         mknode(ex, cs)
     elseif !is_leaf(ex)
