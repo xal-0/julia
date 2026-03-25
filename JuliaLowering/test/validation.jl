@@ -48,7 +48,6 @@ let
         "gc_preserve",
         "isdefined",
         "lambda",
-        "generated_function",
         "foreigncall",
         "cfunction",
         "cconv",

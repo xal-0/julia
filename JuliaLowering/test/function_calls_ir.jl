@@ -573,7 +573,7 @@ end
 #---------------------
 LoweringError:
 function A.ccall()
-#        └─────┘ ── Invalid function name
+#          └───┘ ── ccall is a reserved identifier
 end
 
 ########################################

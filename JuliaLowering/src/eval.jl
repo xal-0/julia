@@ -225,10 +225,12 @@ function to_code_info(ex::SyntaxTree, slots::Vector{Slot}, meta::CompileHints)
         # TODO: Do we actually want unique names here? The C code in
         # `jl_new_code_info_from_ir` has logic to simplify gensym'd names and
         # use the empty string for compiler-generated bindings.
-        ni = get(slot_rename_inds, name, 0)
-        slot_rename_inds[name] = ni + 1
-        if ni > 0
-            name = "$name@$ni"
+        if name !== UNUSED
+            ni = get(slot_rename_inds, name, 0)
+            slot_rename_inds[name] = ni + 1
+            if ni > 0
+                name = "$name@$ni"
+            end
         end
         sname = Symbol(name)
         slotnames[i] = sname

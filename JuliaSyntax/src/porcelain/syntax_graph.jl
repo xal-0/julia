@@ -602,9 +602,6 @@ function Base.filter(f, exs::SyntaxList)
     out
 end
 
-# Would like the following to be an overload of Base.map() ... but need
-# somewhat arcane trickery to ensure that this only tries to collect into a
-# SyntaxList when `f` yields a SyntaxTree.
 function mapsyntax(f, exs::SyntaxList)
     out = SyntaxList(syntax_graph(exs))
     for ex in exs
@@ -613,6 +610,13 @@ function mapsyntax(f, exs::SyntaxList)
     out
 end
 
+function mapindex(sl::SyntaxList, i::Int)
+    out = SyntaxList(syntax_graph(sl))
+    for st in sl
+        push!(out, getindex(st, i))
+    end
+    out
+end
 
 #-------------------------------------------------------------------------------
 # AST creation utilities
