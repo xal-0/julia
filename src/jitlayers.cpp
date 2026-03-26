@@ -2304,7 +2304,8 @@ orc::SymbolStringPtr JuliaOJIT::linkCallTarget(orc::MaterializationResponsibilit
 static bool ccall_lookup(jl_ccall_spec_t spec, void *&addr, bool throw_err)
 {
     void *l = jl_get_library_((const char *)spec.lib, throw_err);
-    if (!l)
+    // `l` may be NULL in the special case that we looked up RTLD_DEFAULT (spec.lib == NULL)
+    if (spec.lib != nullptr && l == nullptr)
         return false;
     if (!jl_dlsym(l, spec.func, &addr, throw_err, 1))
         return false;
