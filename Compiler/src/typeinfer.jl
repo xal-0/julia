@@ -1478,6 +1478,11 @@ function ci_has_invoke(code::CodeInstance)
     return (@atomic :monotonic code.invoke) !== C_NULL
 end
 
+const CI_FLAGS_FROM_IMAGE = 0b0100
+function ci_from_image(code::CodeInstance)
+    return (@atomic :monotonic code.flags) & CI_FLAGS_FROM_IMAGE != 0
+end
+
 function ci_meets_requirement(interp::AbstractInterpreter, code::CodeInstance, source_mode::UInt8)
     source_mode == SOURCE_MODE_NOT_REQUIRED && return true
     source_mode == SOURCE_MODE_ABI && return ci_has_abi(interp, code)
@@ -1729,6 +1734,7 @@ end
 
 function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
     invokelatest_queue::Union{CompilationQueue,Nothing} = nothing,
+    external_linkage::Bool,
 )
     interp = workqueue.interp
     world = get_inference_world(interp)
@@ -1764,6 +1770,7 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
         elseif item isa CodeInstance
             callee = item
             isinspected(workqueue, callee) && continue
+            external_linkage && ci_from_image(callee) && ci_has_invoke(callee) && continue
             mi = get_ci_mi(callee)
             # now make sure everything has source code, if desired
             if use_const_api(callee)
@@ -1810,7 +1817,7 @@ const TRIM_NO = 0x0
 const TRIM_SAFE = 0x1
 const TRIM_UNSAFE = 0x2
 const TRIM_UNSAFE_WARN = 0x3
-function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_mode::UInt8)
+function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_mode::UInt8, external_linkage::Bool)
     inf_params = InferenceParams(; force_enable_inference = trim_mode != TRIM_NO)
 
     # Create an "invokelatest" queue to enable eager compilation of speculative
@@ -1827,13 +1834,13 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
         )
 
         append!(workqueue, methods)
-        compile!(codeinfos, workqueue; invokelatest_queue)
+        compile!(codeinfos, workqueue; invokelatest_queue, external_linkage)
     end
 
     if invokelatest_queue !== nothing
         # This queue is intentionally aliased, to handle e.g. a `finalizer` calling `Core.finalizer`
         # (it will enqueue into itself and immediately drain)
-        compile!(codeinfos, invokelatest_queue; invokelatest_queue)
+        compile!(codeinfos, invokelatest_queue; invokelatest_queue, external_linkage)
     end
 
     if trim_mode != TRIM_NO && trim_mode != TRIM_UNSAFE
