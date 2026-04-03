@@ -2951,13 +2951,15 @@ function _make_macro_name(ctx, ex)
     k = kind(ex)
     if k == K"Identifier" || k == K"Symbol"
         name = setattr!(mkleaf(ex), :kind, k)
-        name.name_val = "@$(ex.name_val)"
-        name
+        setattr!(name, :name_val, "@$(ex.name_val)")
+    elseif k == K"Placeholder"
+        name = setattr!(mkleaf(ex), :kind, K"Identifier")
+        setattr!(name, :name_val, "@$(ex.name_val)")
     elseif is_valid_modref(ex)
         @jl_assert numchildren(ex) == 2 ex
         @ast ctx ex [K"." ex[1] _make_macro_name(ctx, ex[2])]
     else
-        throw(LoweringError(ex, "invalid macro name"))
+        @jl_assert false ex
     end
 end
 
