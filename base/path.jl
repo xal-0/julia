@@ -172,6 +172,13 @@ Return the current user's home directory.
     (for example on how to specify the home directory via environment variables), see the
     [`uv_os_homedir` documentation](http://docs.libuv.org/en/v1.x/misc.html#c.uv_os_homedir).
 
+    homedir(username::AbstractString)::Union{String,Nothing}
+
+Return the home directory for the given `username`, or `nothing` if the user does not exist.
+On Unix, this performs a lookup via `getpwnam_r`. On Windows, the user's SID is resolved and
+the profile path is read from the registry; if that fails, the profile directory is inferred
+from the current user's home directory.
+
 See also [`Sys.username`](@ref).
 """
 function homedir()
@@ -672,10 +679,114 @@ function realpath(path::AbstractString)
 end
 
 if Sys.iswindows()
+
+function homedir(username::AbstractString)
+    # For the current user, just return homedir().
+    current_user = try
+        Sys.username()
+    catch
+        err isa IOError || rethrow()
+        nothing
+    end
+    if username == current_user
+        return homedir()
+    end
+    # Look up the user's SID, then query the registry for their profile path.
+    # This is the same approach Go uses (os/user.Lookup on Windows).
+    home = _win_profile_from_registry(username)
+    home !== nothing && return home
+    # Fallback: assume profiles are siblings in the same parent directory,
+    # but only if the current user's home follows the <parent>/<username>
+    # convention. If not, we can't guess reliably.
+    userhome = homedir()
+    if current_user !== nothing && basename(userhome) == current_user
+        home = joinpath(dirname(userhome), username)
+        isdir(home) && return home
+    end
+    return nothing
+end
+function _win_profile_from_registry(username::AbstractString)
+    # Step 1: Resolve username to a SID via LookupAccountNameW.
+    # First call with zero-length buffers to get required sizes.
+    wuser = cwstring(username)
+    sid_size = Ref{UInt32}(0)
+    domain_size = Ref{UInt32}(0)
+    use = Ref{Int32}(0)
+    ccall((:LookupAccountNameW, "advapi32"), stdcall, Cint,
+          (Ptr{UInt16}, Ptr{UInt16}, Ptr{Cvoid}, Ptr{UInt32},
+           Ptr{UInt16}, Ptr{UInt32}, Ptr{Int32}),
+          C_NULL, wuser, C_NULL, sid_size, C_NULL, domain_size, use)
+    sid_size[] == 0 && return nothing
+    sid_buf = Vector{UInt8}(undef, sid_size[])
+    domain_buf = Vector{UInt16}(undef, domain_size[])
+    ret = ccall((:LookupAccountNameW, "advapi32"), stdcall, Cint,
+                (Ptr{UInt16}, Ptr{UInt16}, Ptr{UInt8}, Ptr{UInt32},
+                 Ptr{UInt16}, Ptr{UInt32}, Ptr{Int32}),
+                C_NULL, wuser, sid_buf, sid_size, domain_buf, domain_size, use)
+    ret == 0 && return nothing
+    # Step 2: Convert SID to string form (e.g. "S-1-5-21-...").
+    str_sid_ptr = Ref{Ptr{UInt16}}(C_NULL)
+    ret = ccall((:ConvertSidToStringSidW, "advapi32"), stdcall, Cint,
+                (Ptr{UInt8}, Ref{Ptr{UInt16}}), sid_buf, str_sid_ptr)
+    ret == 0 && return nothing
+    len = ccall(:wcslen, Csize_t, (Ptr{UInt16},), str_sid_ptr[])
+    sid_str = transcode(String, unsafe_wrap(Array, str_sid_ptr[], len))
+    ccall((:LocalFree, "kernel32"), stdcall, Ptr{Cvoid}, (Ptr{Cvoid},), str_sid_ptr[])
+    # Step 3: Query the registry for the user's ProfileImagePath.
+    subkey = cwstring("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\$sid_str")
+    value = cwstring("ProfileImagePath")
+    buf_size = Ref{UInt32}(0)
+    # RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ = 0x00000006
+    HKEY_LOCAL_MACHINE = 0x80000002 % UInt
+    ret = ccall((:RegGetValueW, "advapi32"), stdcall, Clong,
+                (UInt, Ptr{UInt16}, Ptr{UInt16}, UInt32, Ptr{UInt32}, Ptr{UInt16}, Ptr{UInt32}),
+                HKEY_LOCAL_MACHINE, subkey, value, 0x00000006, C_NULL, C_NULL, buf_size)
+    buf_size[] == 0 && return nothing
+    buf = Vector{UInt16}(undef, buf_size[] ÷ 2)
+    ret = ccall((:RegGetValueW, "advapi32"), stdcall, Clong,
+                (UInt, Ptr{UInt16}, Ptr{UInt16}, UInt32, Ptr{UInt32}, Ptr{UInt16}, Ptr{UInt32}),
+                HKEY_LOCAL_MACHINE, subkey, value, 0x00000006, C_NULL, buf, buf_size)
+    ret != 0 && return nothing
+    # Remove trailing null and convert to String.
+    n = buf_size[] ÷ 2
+    n > 0 && buf[n] == 0 && (n -= 1)
+    home = transcode(String, buf[1:n])
+    return isdir(home) ? home : nothing
+end
 # on windows, ~ means "temporary file"
 expanduser(path::AbstractString) = path
 contractuser(path::AbstractString) = path
-else
+
+else # !Sys.iswindows()
+
+function homedir(username::AbstractString)
+    # Thread-safe user lookup via getpwnam_r.
+    # pwd_storage holds the struct passwd; 256 bytes is a generous upper bound
+    # for all supported platforms (Linux x86-64: ~56 bytes, macOS arm64: ~80 bytes).
+    pwd_storage = zeros(UInt8, 256)
+    # The string buffer holds the pointed-to strings (pw_name, pw_dir, etc.).
+    # Start at 1024 and double on ERANGE if any string is unusually long.
+    buflen = 1024
+    while buflen <= 65536
+        str_buf = Vector{UInt8}(undef, buflen)
+        result = Ref{Ptr{Cvoid}}(C_NULL)
+        ret = ccall(:getpwnam_r, Cint,
+                    (Cstring, Ptr{Cvoid}, Ptr{UInt8}, Csize_t, Ptr{Ptr{Cvoid}}),
+                    username, pwd_storage, str_buf, Csize_t(buflen), result)
+        if ret == 34  # ERANGE: string buffer too small, retry with more space
+            buflen *= 2
+        elseif ret == 0 && result[] != C_NULL
+            # pw_uid sits at offset 2*sizeof(Ptr) in struct passwd on all supported
+            # platforms (after pw_name and pw_passwd, which are both pointer-sized)
+            uid = unsafe_load(Ptr{Cuint}(pointer(pwd_storage) + 2 * sizeof(Ptr{Cvoid})))
+            pd = Libc.getpwuid(uid, false)
+            return pd !== nothing ? pd.homedir : nothing
+        else
+            return nothing  # user not found or error
+        end
+    end
+    return nothing
+end
 function expanduser(path::AbstractString)
     y = iterate(path)
     y === nothing && return path

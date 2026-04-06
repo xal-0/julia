@@ -1,4 +1,5 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
+using Random: randstring
 
 @testset "basic path functions for string type $S" for S in (String, GenericString)
     dir = pwd()
@@ -458,4 +459,13 @@ end
         end == home
     end
     @test isabspath(withenv(homedir, var => nothing))
+    # homedir(username) returns a directory for the current user
+    me = Sys.username()
+    me_home = homedir(me)
+    @test me_home !== nothing
+    @test isdir(me_home)
+    @test isabspath(me_home)
+    # non-existent user returns nothing
+    nouser = "nouser_" * randstring(12)
+    @test homedir(nouser) === nothing
 end
