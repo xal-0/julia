@@ -753,9 +753,28 @@ function _win_profile_from_registry(username::AbstractString)
     home = transcode(String, buf[1:n])
     return isdir(home) ? home : nothing
 end
-# on windows, ~ means "temporary file"
-expanduser(path::AbstractString) = path
-contractuser(path::AbstractString) = path
+function contractuser(path::Union{String, SubString{String}})::String
+    # Walk prefixes of path, checking if any matches homedir() via inode.
+    # Only checks the current user's home (no ~username on Windows).
+    # Preserves the original path string after the matched prefix verbatim.
+    home_st = stat(homedir())
+    ispath(home_st) || return path
+    # check the full path (home directory itself, no trailing separator)
+    samefile(stat(path), home_st) && return "~"
+    # scan for separators; start after the first one to skip the root
+    m = findnext(path_separator_re, path, firstindex(path))
+    m === nothing && return path
+    while true
+        m = findnext(path_separator_re, path, nextind(path, last(m)))
+        m === nothing && return path
+        prefix = SubString(path, 1, prevind(path, first(m)))
+        st = stat(prefix)
+        ispath(st) || return path
+        if samefile(st, home_st)
+            return "~" * SubString(path, first(m))
+        end
+    end
+end
 
 else # !Sys.iswindows()
 
@@ -787,46 +806,106 @@ function homedir(username::AbstractString)
     end
     return nothing
 end
-function expanduser(path::AbstractString)
+function contractuser(path::Union{String, SubString{String}})::String
+    # Walk path prefixes from shortest to longest. At each existing prefix,
+    # check against the current user's home first, then the directory owner's
+    # home via inode comparison. This handles symlinks transparently.
+    # Preserves the original path string after the matched prefix verbatim.
+    home_st = stat(homedir())
+    ispath(home_st) || return path
+    cache_uid = ccall(:getuid, Cuint, ())
+    cache_uname = nothing
+    cache_home_st = nothing
+    # Check the full path (home directory itself, no trailing separator)
+    samefile(stat(path), home_st) && return "~"
+    # Scan for separators; start after the first one to skip the root
+    m = findnext(path_separator_re, path, firstindex(path))
+    m === nothing && return path
+    while true
+        m = findnext(path_separator_re, path, nextind(path, last(m)))
+        m === nothing && return path
+        prefix = SubString(path, 1, prevind(path, first(m)))
+        st = stat(prefix)
+        ispath(st) || return path
+        rest = SubString(path, first(m))
+        if samefile(st, home_st)
+            return "~" * rest
+        end
+        uid = st.uid
+        if uid != cache_uid
+            cache_uid = uid
+            pd = Libc.getpwuid(uid, false)
+            cache_uname = pd !== nothing && !isempty(pd.username) ? pd.username : nothing
+            if cache_uname !== nothing
+                pw_home = homedir(cache_uname)
+                cache_home_st = pw_home !== nothing ? stat(pw_home) : nothing
+            else
+                cache_home_st = nothing
+            end
+        end
+        if cache_home_st !== nothing && ispath(cache_home_st) && samefile(st, cache_home_st)
+            return "~$(cache_uname)" * rest
+        end
+    end
+end
+
+end # if Sys.iswindows()
+
+function expanduser(path::Union{String, SubString{String}})::String
     y = iterate(path)
     y === nothing && return path
     c, i = y::Tuple{eltype(path),Int}
     c != '~' && return path
-    y = iterate(path, i)
-    y === nothing && return homedir()
-    y[1]::eltype(path) == '/' && return homedir() * path[i:end]
-    throw(ArgumentError("~user tilde expansion not yet implemented"))
-end
-function contractuser(path::AbstractString)
-    home = homedir()
-    if path == home
-        return "~"
-    elseif startswith(path, home)
-        return joinpath("~", relpath(path, home))
-    else
+    # collect username: everything after ~ up to separator or end
+    m = findnext(path_separator_re, path, i)
+    j = prevind(path, m === nothing ?
+        nextind(path, lastindex(path)) : first(m))
+    username = SubString(path, i, j)
+    # can't use a regex because of bootstrap order
+    if isempty(username)
+        home = homedir()
+    elseif Sys.iswindows() || # ~username not supported on Windows
+        !all(c -> isletter(c) || isdigit(c) || c in "._-", username) # invalid
         return path
+    else
+        home = homedir(username)
+        home === nothing && return path
     end
-end
+    # use first separator in the rest of path in home
+    if m !== nothing
+        if Sys.iswindows()
+            sep = path[first(m)]
+            home = replace(home, path_separator_re => sep)
+        end
+        return home * SubString(path, first(m))
+    end
+    return home
 end
 
 
 """
     expanduser(path::AbstractString)::AbstractString
 
-On Unix systems, replace a tilde character at the start of a path with the current user's home directory.
+Replace a tilde character at the start of a path with the current user's home directory.
+On Unix, `~username` at the start of a path is replaced with that user's home directory;
+if the user does not exist the path is returned unchanged. On Windows, only `~` expansion
+is supported (not `~username`).
 
 See also: [`contractuser`](@ref).
 """
-expanduser(path::AbstractString)
+expanduser(path::AbstractString) = expanduser(String(path))
 
 """
     contractuser(path::AbstractString)::AbstractString
 
-On Unix systems, if the path starts with `homedir()`, replace it with a tilde character.
+Replace a home directory prefix in `path` with a tilde. If the path starts with the
+current user's home directory it is replaced with `~`. On Unix, if it starts with
+another user's home directory it is replaced with `~username`. The path is returned
+unchanged if no home directory prefix is found.
 
 See also: [`expanduser`](@ref).
 """
-contractuser(path::AbstractString)
+contractuser(path::AbstractString) = contractuser(String(path))
 
 
 """

@@ -1417,12 +1417,9 @@ mktempdir() do path
 end
 
 # Test tilde path completion
-let (c, r, res) = test_complete("\"~/ka8w5rsz")
-    if !Sys.iswindows()
-        @test res && c == String[homedir() * "/ka8w5rsz\""]
-    else
-        @test !res
-    end
+let home = replace(homedir(), "\\" => "/"),
+    (c, r, res) = test_complete("\"~/ka8w5rsz")
+    @test res && c == String["$home/ka8w5rsz\""]
 
     c, r, res = test_complete("\"foo~bar")
     @test !res
