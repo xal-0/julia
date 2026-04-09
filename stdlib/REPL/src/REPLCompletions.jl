@@ -309,11 +309,10 @@ const sorted_keyvals = ["false", "true"]
 complete_keyval!(suggestions::Vector{Completion}, s::String) =
     complete_from_list!(suggestions, KeyvalCompletion, sorted_keyvals, s)
 
-function do_cmd_escape(s)
-    return Base.escape_raw_string(Base.shell_escape_posixly(s), '`')
-end
-function do_shell_escape(s)
-    return Base.shell_escape_posixly(s)
+function do_cmd_escape(s; escape_backticks::Bool=false)
+    s = Base.shell_escape_posixly(s)
+    escape_backticks && (s = Base.escape_raw_string(s, '`'))
+    return s
 end
 function do_string_escape(s)
     return escape_string(s, ('\"','$'))
@@ -436,12 +435,11 @@ end
 
 function complete_path(path::AbstractString;
                        use_envpath=false,
-                       shell_escape=false,
                        cmd_escape=false,
+                       escape_backticks=false,
                        string_escape=false,
                        contract_user=false,
                        dirsep=Sys.iswindows() ? '\\' : '/')
-    @assert !(shell_escape && string_escape)
     if Base.Sys.isunix() && occursin(r"^~(?:/|$)", path)
         # if the path is just "~", don't consider the expanded username as a prefix
         if path == "~"
@@ -484,8 +482,8 @@ function complete_path(path::AbstractString;
         end
     end
 
-    matches = ((shell_escape ? do_shell_escape(s) : string_escape ? do_string_escape(s) : s) for s in matches)
-    matches = ((cmd_escape ? do_cmd_escape(s) : s) for s in matches)
+    matches = ((string_escape ? do_string_escape(s) : s) for s in matches)
+    matches = ((cmd_escape ? do_cmd_escape(s; escape_backticks) : s) for s in matches)
     matches = Completion[PathCompletion(contract_user ? contractuser(s) : s) for s in matches]
     return matches, dir, !isempty(matches)
 end
@@ -493,12 +491,11 @@ end
 function complete_path(path::AbstractString,
                        pos::Int;
                        use_envpath=false,
-                       shell_escape=false,
                        string_escape=false,
                        contract_user=false)
     ## TODO: enable this depwarn once Pkg is fixed
     #Base.depwarn("complete_path with pos argument is deprecated because the return value [2] is incorrect to use", :complete_path)
-    paths, dir, success = complete_path(path; use_envpath, shell_escape, string_escape, dirsep='/')
+    paths, dir, success = complete_path(path; use_envpath, string_escape, dirsep='/')
 
     if Base.Sys.isunix() && occursin(r"^~(?:/|$)", path)
         # if the path is just "~", don't consider the expanded username as a prefix
@@ -1044,7 +1041,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
     #   `file ~/example.txt TAB  => `file /home/user/example.txt
     if (n = find_parent(cur, K"CmdString")) !== nothing
         off = char_first(n) - 1
-        ret, r, success = shell_completions(string[char_range(n)], pos - off, hint, cmd_escape=true)
+        ret, r, success = shell_completions(string[char_range(n)], pos - off, hint, escape_backticks=true)
         success && return ret, r .+ off, success
     end
 
@@ -1300,7 +1297,7 @@ function method_search(partial::AbstractString, context_module::Module, shift::B
     end
 end
 
-function shell_completions(str, pos, hint::Bool=false; cmd_escape::Bool=false)
+function shell_completions(str, pos, hint::Bool=false; escape_backticks::Bool=false)
     # First parse everything up to the current position
     scs = str[1:pos]
     args, last_arg_start = try
@@ -1325,7 +1322,7 @@ function shell_completions(str, pos, hint::Bool=false; cmd_escape::Bool=false)
         return ret, range, true
     elseif endswith(scs, ' ') && !endswith(scs, "\\ ")
         r = pos+1:pos
-        paths, dir, success = complete_path(""; use_envpath=false, shell_escape=!cmd_escape, cmd_escape, dirsep='/')
+        paths, dir, success = complete_path(""; use_envpath=false, cmd_escape=true, escape_backticks, dirsep='/')
         return paths, r, success
     elseif all(@nospecialize(arg) -> arg isa AbstractString, ex.args)
         # Join these and treat this as a path
@@ -1335,15 +1332,15 @@ function shell_completions(str, pos, hint::Bool=false; cmd_escape::Bool=false)
         # Also try looking into the env path if the user wants to complete the first argument
         use_envpath = length(args.args) < 2
 
-        paths, success = complete_path_string(path, hint; use_envpath, shell_escape=!cmd_escape, cmd_escape, dirsep='/')
+        paths, success = complete_path_string(path, hint; use_envpath, cmd_escape=true, escape_backticks, dirsep='/')
         return paths, r, success
     end
     return Completion[], 1:0, false
 end
 
 function complete_path_string(path, hint::Bool=false;
-                              shell_escape::Bool=false,
                               cmd_escape::Bool=false,
+                              escape_backticks::Bool=false,
                               string_escape::Bool=false,
                               dirsep='/',
                               kws...)
@@ -1360,9 +1357,8 @@ function complete_path_string(path, hint::Bool=false;
     end
 
     function escape(p)
-        shell_escape && (p = do_shell_escape(p))
         string_escape && (p = do_string_escape(p))
-        cmd_escape && (p = do_cmd_escape(p))
+        cmd_escape && (p = do_cmd_escape(p; escape_backticks))
         p
     end
 
