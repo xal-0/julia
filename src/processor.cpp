@@ -682,6 +682,19 @@ jl_clone_targets_t jl_get_llvm_clone_targets(const char *cpu_target)
 }
 #endif
 
+extern "C" char *jl_get_llvm_clone_targets_blob(const char *cpu_target, size_t *size)
+{
+    auto target_str = jl_expand_sysimage_keyword(cpu_target);
+    auto specs = tp::resolve_targets_for_llvm(target_str);
+    if (specs.empty())
+        jl_error("No targets specified");
+    auto blob = tp::serialize_targets(specs);
+    char *ret = (char *)malloc(blob.size());
+    *size = blob.size();
+    memcpy(ret, blob.data(), blob.size());
+    return ret;
+}
+
 extern "C" int jl_test_cpu_feature(jl_cpu_feature_t feature)
 {
     auto host_feats = tp::get_host_features();

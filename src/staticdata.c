@@ -3250,29 +3250,17 @@ static void jl_write_header_for_incremental(ios_t *f, jl_array_t *worklist, jl_a
     write_mod_list(f, mod_array);
 }
 
-JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *worklist, bool_t emit_split,
-                                         ios_t **s, ios_t **z, jl_array_t **udeps, int64_t *srctextpos, jl_array_t *module_init_order)
+JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *worklist, int emit_split, int compress,
+                                         ios_t **s, jl_array_t **udeps, int64_t *srctextpos, jl_array_t *module_init_order)
 {
     JL_TIMING(SYSIMG_DUMP, SYSIMG_DUMP);
 
-    // iff emit_split
-    // write header and src_text to one file f/s
-    // write systemimg to a second file ff/z
     jl_task_t *ct = jl_current_task;
     ios_t *f = (ios_t*)malloc_s(sizeof(ios_t));
     ios_mem(f, 0);
 
-    ios_t *ff = NULL;
-    if (emit_split) {
-        ff = (ios_t*)malloc_s(sizeof(ios_t));
-        ios_mem(ff, 0);
-    } else {
-        ff = f;
-    }
-
     jl_array_t *mod_array = NULL, *extext_methods = NULL, *new_ext_cis = NULL, *ext_foreign_cis = NULL;
     int64_t checksumpos = 0;
-    int64_t checksumpos_ff = 0;
     int64_t datastartpos = 0;
     JL_GC_PUSH4(&mod_array, &extext_methods, &new_ext_cis, &ext_foreign_cis);
 
@@ -3286,17 +3274,7 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
             *_native_data = jl_create_native(NULL, 0, 1, jl_atomic_load_acquire(&jl_world_counter), NULL, suppress_precompile ? (jl_array_t*)jl_an_empty_vec_any : worklist, 0, module_init_order, ext_foreign_cis);
         }
         jl_write_header_for_incremental(f, worklist, mod_array, udeps, srctextpos, &checksumpos);
-        if (emit_split) {
-            checksumpos_ff = write_header(ff, 1);
-            write_uint8(ff, jl_cache_flags());
-            write_uint8(ff, jl_get_toplevel_syntax_version());
-            write_mod_list(ff, mod_array);
-        }
-        else {
-            checksumpos_ff = checksumpos;
-        }
-    }
-    else if (_native_data != NULL) {
+    } else if (_native_data != NULL) {
         *_native_data = jl_create_native(NULL, jl_options.trim, 0, jl_atomic_load_acquire(&jl_world_counter), mod_array, NULL, jl_options.compile_enabled == JL_OPTIONS_COMPILE_ALL, module_init_order, ext_foreign_cis);
     }
     if (_native_data != NULL)
@@ -3348,19 +3326,25 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
         extext_methods = jl_alloc_vec_any(0);
         jl_collect_extext_methods(extext_methods, mod_array);
 
-        if (!emit_split) {
-            write_int32(f, 0); // No clone_targets
-            write_padding(f, LLT_ALIGN(ios_pos(f), JL_CACHE_BYTE_ALIGNMENT) - ios_pos(f));
+        if (emit_split) {
+            size_t size;
+            char *targets = jl_get_llvm_clone_targets_blob(jl_options.cpu_target, &size);
+            write_uint32(f, size);
+            ios_write(f, targets, size);
+            free(targets);
         }
         else {
-            write_padding(ff, LLT_ALIGN(ios_pos(ff), JL_CACHE_BYTE_ALIGNMENT) - ios_pos(ff));
+            write_uint32(f, 0);
         }
-        datastartpos = ios_pos(ff);
+
+        write_padding(f, LLT_ALIGN(ios_pos(f), JL_CACHE_BYTE_ALIGNMENT) - ios_pos(f));
+
+        datastartpos = ios_pos(f);
     }
 
     jl_query_cache query_cache;
     init_query_cache(&query_cache);
-    jl_save_system_image_to_stream(ff, mod_array, module_init_order, worklist, extext_methods, new_ext_cis, &query_cache);
+    jl_save_system_image_to_stream(f, mod_array, module_init_order, worklist, extext_methods, new_ext_cis, &query_cache);
     if (_native_data != NULL)
         native_functions = NULL;
     // make sure we don't run any Julia code concurrently before this point
@@ -3368,32 +3352,36 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
     jl_gc_enable_finalizers(ct, 1);
     ct->reentrant_timing &= ~0b1000u;
 
-    if (worklist) {
-        // Go back and update the checksum in the header
-        int64_t dataendpos = ios_pos(ff);
-        uint32_t checksum = jl_crc32c(0, &ff->buf[datastartpos], dataendpos - datastartpos);
-        ios_seek(ff, checksumpos_ff);
-        write_uint64(ff, checksum | ((uint64_t)0xfafbfcfd << 32));
-        write_uint64(ff, datastartpos);
-        write_uint64(ff, dataendpos);
-        ios_seek(ff, dataendpos);
+    int64_t dataendpos = ios_pos(f);
+    uint32_t checksum = checksumpos ? jl_crc32c(0, &f->buf[datastartpos], dataendpos - datastartpos) : 0;
 
-        // Write the checksum to the split header if necessary
-        if (emit_split) {
-            int64_t cur = ios_pos(f);
-            ios_seek(f, checksumpos);
-            write_uint64(f, checksum | ((uint64_t)0xfafbfcfd << 32));
-            ios_seek(f, cur);
-            // Next we will write the clone_targets and afterwards the srctext
-        }
+    if (compress) {
+        size_t heap_size = dataendpos - datastartpos;
+        size_t bound = ZSTD_compressBound(heap_size);
+        char *buf = (char *)malloc(bound);
+        size_t comp_size = ZSTD_compress(buf, bound, f->buf + datastartpos, heap_size, 15);
+        if (ZSTD_isError(comp_size))
+            jl_errorf("compression of system image failed: %s", ZSTD_getErrorName(comp_size));
+        ios_trunc(f, datastartpos);
+        ios_seek(f, datastartpos);
+        ios_write(f, buf, comp_size);
+        free(buf);
+        dataendpos = ios_pos(f);
+    }
+
+    if (checksumpos){
+        // Go back and update the checksum in the header
+        ios_seek(f, checksumpos);
+        write_uint64(f, checksum | ((uint64_t)0xfafbfcfd << 32));
+        write_uint64(f, datastartpos);
+        write_uint64(f, dataendpos);
+        ios_seek(f, dataendpos);
     }
 
     destroy_query_cache(&query_cache);
 
     JL_GC_POP();
     *s = f;
-    if (emit_split)
-        *z = ff;
     return;
 }
 
@@ -3453,52 +3441,50 @@ static void jl_prefetch_system_image(const char *data, size_t size)
 #endif
 }
 
+static void jl_image_load_metadata(void *handle, jl_image_buf_t *image)
+{
+    jl_dlsym(handle, "jl_image_pointers", (void **)&image->pointers, 1, 0);
+}
+
 JL_DLLEXPORT void jl_image_unpack_uncomp(void *handle, jl_image_buf_t *image)
 {
     size_t *plen;
     uint32_t *pchecksum;
     jl_dlsym(handle, "jl_system_image_size", (void **)&plen, 1, 0);
     jl_dlsym(handle, "jl_system_image_data", (void **)&image->data, 1, 0);
-    jl_dlsym(handle, "jl_image_pointers", (void**)&image->pointers, 1, 0);
     jl_dlsym(handle, "jl_system_image_checksum", (void **)&pchecksum, 1, 0);
     image->size = *plen;
     image->checksum = *pchecksum;
+    jl_image_load_metadata(handle, image);
     jl_prefetch_system_image(image->data, image->size);
 }
 
-JL_DLLEXPORT void jl_image_unpack_zstd(void *handle, jl_image_buf_t *image)
+// Allocate a page-aligned buffer of at least `size` bytes, preferring
+// large/huge pages when available.
+static char *jl_image_alloc_pages(size_t size)
 {
-    size_t *plen;
-    uint32_t *pchecksum;
-    const char *data;
-    jl_dlsym(handle, "jl_system_image_size", (void **)&plen, 1, 0);
-    jl_dlsym(handle, "jl_system_image_data", (void **)&data, 1, 0);
-    jl_dlsym(handle, "jl_image_pointers", (void **)&image->pointers, 1, 0);
-    jl_dlsym(handle, "jl_system_image_checksum", (void **)&pchecksum, 1, 0);
-    image->checksum = *pchecksum;
-    jl_prefetch_system_image(data, *plen);
-    image->size = ZSTD_getFrameContentSize(data, *plen);
     size_t page_size = jl_getpagesize(); /* jl_page_size is not set yet when loading sysimg */
-    size_t aligned_size = LLT_ALIGN(image->size, page_size);
+    size_t aligned_size = LLT_ALIGN(size, page_size);
+    char *data = NULL;
     int fail = 0;
 #if defined(_OS_WINDOWS_)
     size_t large_page_size = GetLargePageMinimum();
-    image->data = NULL;
-    if (large_page_size > 0 && image->size > 4 * large_page_size) {
-        size_t aligned_size = LLT_ALIGN(image->size, large_page_size);
-        image->data = (char *)VirtualAlloc(
-            NULL, aligned_size, MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES, PAGE_READWRITE);
+    if (large_page_size > 0 && size > 4 * large_page_size) {
+        size_t large_aligned_size = LLT_ALIGN(size, large_page_size);
+        data = (char *)VirtualAlloc(NULL, large_aligned_size,
+                                    MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES,
+                                    PAGE_READWRITE);
     }
-    if (!image->data) {
+    if (!data) {
         /* Try small pages if large pages failed. */
-        image->data = (char *)VirtualAlloc(NULL, aligned_size, MEM_COMMIT | MEM_RESERVE,
-                                           PAGE_READWRITE);
+        data = (char *)VirtualAlloc(NULL, aligned_size, MEM_COMMIT | MEM_RESERVE,
+                                    PAGE_READWRITE);
     }
-    fail = !image->data;
+    fail = !data;
 #else
-    image->data = (char *)mmap(NULL, aligned_size, PROT_READ | PROT_WRITE,
-                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    fail = image->data == (void *)-1;
+    data = (char *)mmap(NULL, aligned_size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    fail = data == (void *)-1;
 #endif
     if (fail) {
         const char *err;
@@ -3513,8 +3499,26 @@ JL_DLLEXPORT void jl_image_unpack_zstd(void *handle, jl_image_buf_t *image)
                   err);
         jl_exit(1);
     }
+    return data;
+}
+
+JL_DLLEXPORT void jl_image_unpack_zstd(void *handle, jl_image_buf_t *image)
+{
+    size_t *plen;
+    uint32_t *pchecksum;
+    const char *data;
+    jl_dlsym(handle, "jl_system_image_size", (void **)&plen, 1, 0);
+    jl_dlsym(handle, "jl_system_image_data", (void **)&data, 1, 0);
+    jl_dlsym(handle, "jl_image_pointers", (void **)&image->pointers, 1, 0);
+    jl_dlsym(handle, "jl_system_image_checksum", (void **)&pchecksum, 1, 0);
+    image->checksum = *pchecksum;
+    jl_image_load_metadata(handle, image);
+    jl_prefetch_system_image(data, *plen);
+    image->size = ZSTD_getFrameContentSize(data, *plen);
+    image->data = jl_image_alloc_pages(image->size);
 
     ZSTD_decompress((void *)image->data, image->size, data, *plen);
+    size_t page_size = jl_getpagesize();
     size_t len = (*plen) & ~(page_size - 1);
 #ifdef _OS_WINDOWS_
     if (len)
@@ -3522,6 +3526,53 @@ JL_DLLEXPORT void jl_image_unpack_zstd(void *handle, jl_image_buf_t *image)
 #else
     munmap((void *)data, len);
 #endif
+}
+
+static size_t jl_image_get_split_ji(void *handle, char **dest, int use_pages)
+{
+    const char *lib_path = jl_pathname_for_handle(handle);
+    if (!lib_path) {
+        jl_printf(JL_STDERR, "unable to find path to native image\n");
+        abort();
+    }
+
+    // Replace the file extension with ".ji"
+    char ji_path[JL_PATH_MAX];
+    const char *dot_pos = strrchr(lib_path, '.');
+    int ji_path_len = dot_pos ? dot_pos - lib_path : strlen(lib_path);
+    memcpy(ji_path, lib_path, ji_path_len);
+    snprintf(ji_path + ji_path_len, sizeof ji_path - ji_path_len, ".ji");
+
+    ios_t s;
+    if (!ios_file(&s, ji_path, 1, 0, 0, 0)) {
+        jl_printf(JL_STDERR, "unable to open .ji associated with native image: %s\n",
+                  ji_path);
+        abort();
+    }
+
+    size_t size = ios_filesize(&s);
+    *dest = use_pages ? jl_image_alloc_pages(size) : (char *)malloc(size);
+    ios_bufmode(&s, bm_none);
+    ios_readall(&s, *dest, size);
+    ios_close(&s);
+    return size;
+}
+
+JL_DLLEXPORT void jl_image_unpack_split(void *handle, jl_image_buf_t *image)
+{
+    image->size = jl_image_get_split_ji(handle, (char **)&image->data, 1);
+    jl_image_load_metadata(handle, image);
+}
+
+JL_DLLEXPORT void jl_image_unpack_split_zstd(void *handle, jl_image_buf_t *image)
+{
+    char *comp_data;
+    size_t comp_size = jl_image_get_split_ji(handle, &comp_data, 0);
+    jl_image_load_metadata(handle, image);
+    image->size = ZSTD_getFrameContentSize(comp_data, comp_size);
+    image->data = jl_image_alloc_pages(image->size);
+    ZSTD_decompress((void *)image->data, image->size, comp_data, comp_size);
+    free(comp_data);
 }
 
 // From a shared library handle, verify consistency and return a jl_image_buf_t

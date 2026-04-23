@@ -266,4 +266,14 @@ extern "C" JL_DLLEXPORT jl_value_t *jl_feature_bits_to_string(const uint8_t *bit
 extern "C" JL_DLLEXPORT std::string jl_expand_sysimage_keyword(const char *cpu_target);
 #endif
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+char *jl_get_llvm_clone_targets_blob(const char *cpu_target, size_t *size);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif
