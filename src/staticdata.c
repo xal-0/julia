@@ -3540,6 +3540,8 @@ static size_t jl_image_get_split_ji(void *handle, char **dest, int use_pages)
     char ji_path[JL_PATH_MAX];
     const char *dot_pos = strrchr(lib_path, '.');
     int ji_path_len = dot_pos ? dot_pos - lib_path : strlen(lib_path);
+    if (ji_path_len > JL_PATH_MAX - 4)
+        abort();
     memcpy(ji_path, lib_path, ji_path_len);
     snprintf(ji_path + ji_path_len, sizeof ji_path - ji_path_len, ".ji");
 
