@@ -133,9 +133,7 @@ JL_DLLEXPORT void jl_write_compiler_output(void)
     const char *outputji = jl_options.outputji;
 
     bool_t emit_split = outputji && emit_native;
-    // Not supported right now: non-split .ji (needs unpack function to
-    // decompress), and split pkgimage (need to change header format some more).
-    int comp = jl_options.compress_sysimage && emit_native && !outputji;
+    int comp = jl_options.compress_sysimage;
 
     ios_t *s = NULL;
     int64_t srctextpos = 0 ;
