@@ -162,7 +162,7 @@ JL_DLLEXPORT void jl_write_compiler_output(void)
             emit_split ? (comp ? "jl_image_unpack_split_zstd" : "jl_image_unpack_split") :
                          (comp ? "jl_image_unpack_zstd" : "jl_image_unpack_uncomp");
 
-        // jl_dump_native will close and free z when appropriate
+        // jl_dump_native will close and free s when appropriate
         // this is a horrible abstraction, but
         // this helps reduce live memory significantly
         jl_dump_native(native_code,
