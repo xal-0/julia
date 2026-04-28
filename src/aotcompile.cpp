@@ -1969,8 +1969,9 @@ jl_emission_params_t default_emission_params = { 1 };
 
 void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fname,
                            const char *unopt_bc_fname, const char *obj_fname,
-                           const char *asm_fname, ios_t *z, const char *unpack_func,
-                           jl_emission_params_t *params, Module &dataM)
+                           const char *asm_fname, ios_t *z, uint32_t checksum,
+                           const char *unpack_func, jl_emission_params_t *params,
+                           Module &dataM)
 {
     // We don't want to use MCJIT's target machine because
     // it uses the large code model and we may potentially
@@ -2046,7 +2047,6 @@ void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fname,
 
         if (z) {
             ArrayRef<char> sysimg_data{z->buf, (size_t)z->size};
-            uint32_t sysimg_checksum = jl_crc32c(0, z->buf, z->size);
             Constant *data = ConstantDataArray::get(Context, sysimg_data);
             auto sysdata = new GlobalVariable(sysimgM, data->getType(), false,
                                               GlobalVariable::ExternalLinkage,
@@ -2063,16 +2063,17 @@ void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fname,
             addComdat(new GlobalVariable(sysimgM, len->getType(), true,
                                          GlobalVariable::ExternalLinkage,
                                          len, "jl_system_image_size"), TheTriple);
-            Constant *checksum_val = ConstantInt::get(Type::getInt32Ty(Context), sysimg_checksum);
-            addComdat(new GlobalVariable(sysimgM, checksum_val->getType(), true,
-                                         GlobalVariable::ExternalLinkage,
-                                         checksum_val, "jl_system_image_checksum"), TheTriple);
 
             // Free z here, since we've copied out everything into data
             // Results in serious memory savings
             ios_close(z);
             free(z);
         }
+
+        Constant *checksum_val = ConstantInt::get(Type::getInt32Ty(Context), checksum);
+        addComdat(new GlobalVariable(sysimgM, checksum_val->getType(), true,
+                                     GlobalVariable::ExternalLinkage,
+                                     checksum_val, "jl_system_image_checksum"), TheTriple);
 
         auto unpack =
             new GlobalVariable(sysimgM, DL.getIntPtrType(Context), true,
@@ -2314,12 +2315,11 @@ void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fname,
 
 // takes the running content that has collected in the shadow module and dump it to disk
 // this builds the object file portion of the sysimage files for fast startup
-extern "C" JL_DLLEXPORT_CODEGEN
-void jl_dump_native_impl(void *native_code,
-        const char *bc_fname, const char *unopt_bc_fname, const char *obj_fname,
-        const char *asm_fname,
-        ios_t *z, const char *unpack_func,
-        jl_emission_params_t *params)
+extern "C" JL_DLLEXPORT_CODEGEN void
+jl_dump_native_impl(void *native_code, const char *bc_fname, const char *unopt_bc_fname,
+                    const char *obj_fname, const char *asm_fname, ios_t *z,
+                    uint32_t checksum, const char *unpack_func,
+                    jl_emission_params_t *params)
 {
     JL_TIMING(NATIVE_AOT, NATIVE_Dump);
     jl_native_code_desc_t *data = (jl_native_code_desc_t*)native_code;
@@ -2335,7 +2335,7 @@ void jl_dump_native_impl(void *native_code,
 
     data->TSM_ref->withModuleDo([&](Module &dataM) {
         jl_dump_native_locked(data, bc_fname, unopt_bc_fname, obj_fname, asm_fname, z,
-                              unpack_func, params, dataM);
+                              checksum, unpack_func, params, dataM);
     });
 }
 

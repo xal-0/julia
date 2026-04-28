@@ -137,9 +137,10 @@ JL_DLLEXPORT void jl_write_compiler_output(void)
 
     ios_t *s = NULL;
     int64_t srctextpos = 0 ;
-    jl_create_system_image(emit_native ? &native_code : NULL,
-                           jl_options.incremental ? worklist : NULL, emit_split, comp,
-                           &s, &udeps, &srctextpos, jl_module_init_order);
+    uint32_t checksum =
+        jl_create_system_image(emit_native ? &native_code : NULL,
+                               jl_options.incremental ? worklist : NULL, emit_split, comp,
+                               &s, &udeps, &srctextpos, jl_module_init_order);
 
     ios_t f;
 
@@ -163,12 +164,9 @@ JL_DLLEXPORT void jl_write_compiler_output(void)
         // jl_dump_native will close and free s when appropriate
         // this is a horrible abstraction, but
         // this helps reduce live memory significantly
-        jl_dump_native(native_code,
-                        jl_options.outputbc,
-                        jl_options.outputunoptbc,
-                        jl_options.outputo,
-                        jl_options.outputasm,
-                        outputji ? NULL : s, unpack_func, NULL);
+        jl_dump_native(native_code, jl_options.outputbc, jl_options.outputunoptbc,
+                       jl_options.outputo, jl_options.outputasm, outputji ? NULL : s,
+                       checksum, unpack_func, NULL);
         jl_postoutput_hook();
     }
 

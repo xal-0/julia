@@ -3250,8 +3250,10 @@ static void jl_write_header_for_incremental(ios_t *f, jl_array_t *worklist, jl_a
     write_mod_list(f, mod_array);
 }
 
-JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *worklist, int emit_split, int compress,
-                                         ios_t **s, jl_array_t **udeps, int64_t *srctextpos, jl_array_t *module_init_order)
+JL_DLLEXPORT uint32_t jl_create_system_image(void **_native_data, jl_array_t *worklist,
+                                             int emit_split, int compress, ios_t **s,
+                                             jl_array_t **udeps, int64_t *srctextpos,
+                                             jl_array_t *module_init_order)
 {
     JL_TIMING(SYSIMG_DUMP, SYSIMG_DUMP);
 
@@ -3382,7 +3384,7 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
 
     JL_GC_POP();
     *s = f;
-    return;
+    return checksum;
 }
 
 // Takes in a path of the form "usr/lib/julia/sys.so"
@@ -3443,18 +3445,18 @@ static void jl_prefetch_system_image(const char *data, size_t size)
 
 static void jl_image_load_metadata(void *handle, jl_image_buf_t *image)
 {
+    uint32_t *pchecksum;
     jl_dlsym(handle, "jl_image_pointers", (void **)&image->pointers, 1, 0);
+    jl_dlsym(handle, "jl_system_image_checksum", (void **)&pchecksum, 1, 0);
+    image->checksum = *pchecksum;
 }
 
 JL_DLLEXPORT void jl_image_unpack_uncomp(void *handle, jl_image_buf_t *image)
 {
     size_t *plen;
-    uint32_t *pchecksum;
     jl_dlsym(handle, "jl_system_image_size", (void **)&plen, 1, 0);
     jl_dlsym(handle, "jl_system_image_data", (void **)&image->data, 1, 0);
-    jl_dlsym(handle, "jl_system_image_checksum", (void **)&pchecksum, 1, 0);
     image->size = *plen;
-    image->checksum = *pchecksum;
     jl_image_load_metadata(handle, image);
     jl_prefetch_system_image(image->data, image->size);
 }
@@ -3505,13 +3507,10 @@ static char *jl_image_alloc_pages(size_t size)
 JL_DLLEXPORT void jl_image_unpack_zstd(void *handle, jl_image_buf_t *image)
 {
     size_t *plen;
-    uint32_t *pchecksum;
     const char *data;
     jl_dlsym(handle, "jl_system_image_size", (void **)&plen, 1, 0);
     jl_dlsym(handle, "jl_system_image_data", (void **)&data, 1, 0);
     jl_dlsym(handle, "jl_image_pointers", (void **)&image->pointers, 1, 0);
-    jl_dlsym(handle, "jl_system_image_checksum", (void **)&pchecksum, 1, 0);
-    image->checksum = *pchecksum;
     jl_image_load_metadata(handle, image);
     jl_prefetch_system_image(data, *plen);
     image->size = ZSTD_getFrameContentSize(data, *plen);
