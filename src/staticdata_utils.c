@@ -630,32 +630,6 @@ JL_DLLEXPORT uint8_t jl_match_cache_flags_current(uint8_t flags)
     return jl_match_cache_flags(jl_cache_flags(), flags);
 }
 
-// return char* from String field in Base.GIT_VERSION_INFO
-static const char *git_info_string(const char *fld)
-{
-    static jl_value_t *GIT_VERSION_INFO = NULL;
-    if (!GIT_VERSION_INFO)
-        GIT_VERSION_INFO = jl_get_global(jl_base_module, jl_symbol("GIT_VERSION_INFO"));
-    jl_value_t *f = jl_get_field(GIT_VERSION_INFO, fld);
-    assert(jl_is_string(f));
-    return jl_string_data(f);
-}
-
-static const char *jl_git_branch(void)
-{
-    static const char *branch = NULL;
-    if (!branch) branch = git_info_string("branch");
-    return branch;
-}
-
-static const char *jl_git_commit(void)
-{
-    static const char *commit = NULL;
-    if (!commit) commit = git_info_string("commit");
-    return commit;
-}
-
-
 // "magic" string and version header of .ji file
 static const int JI_FORMAT_VERSION = 14;
 static const char JI_MAGIC[] = "\373jli\r\n\032\n"; // based on PNG signature
@@ -669,7 +643,7 @@ static int64_t write_header(ios_t *s, uint8_t pkgimage)
     ios_write(s, JL_BUILD_UNAME, strlen(JL_BUILD_UNAME)+1);
     ios_write(s, JL_BUILD_ARCH, strlen(JL_BUILD_ARCH)+1);
     ios_write(s, JULIA_VERSION_STRING, strlen(JULIA_VERSION_STRING)+1);
-    const char *branch = jl_git_branch(), *commit = jl_git_commit();
+    const char *branch = JULIA_GIT_BRANCH, *commit = JULIA_GIT_COMMIT;
     ios_write(s, branch, strlen(branch)+1);
     ios_write(s, commit, strlen(commit)+1);
     write_uint8(s, pkgimage);
@@ -972,8 +946,8 @@ JL_DLLEXPORT uint64_t jl_read_verify_header(ios_t *s, uint8_t *pkgimage, int64_t
         readstr_verify(s, JL_BUILD_UNAME, 1) &&
         readstr_verify(s, JL_BUILD_ARCH, 1) &&
         readstr_verify(s, JULIA_VERSION_STRING, 1) &&
-        readstr_verify(s, jl_git_branch(), 1) &&
-        readstr_verify(s, jl_git_commit(), 1))
+        readstr_verify(s, JULIA_GIT_BRANCH, 1) &&
+        readstr_verify(s, JULIA_GIT_COMMIT, 1))
     {
         *pkgimage = read_uint8(s);
         checksum = read_uint64(s);

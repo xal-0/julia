@@ -452,6 +452,7 @@ $(BUILDDIR)/flisp/libflisp.a: $(addprefix $(SRCDIR)/flisp/,*.h *.c) $(BUILDDIR)/
 $(BUILDDIR)/flisp/libflisp-debug.a: $(addprefix $(SRCDIR)/,flisp/*.h flisp/*.c) $(BUILDDIR)/support/libsupport-debug.a $(BUILDDIR)/julia.expmap
 	$(MAKE) -C $(SRCDIR)/flisp debug BUILDDIR='$(abspath $(BUILDDIR)/flisp)'
 
+# See comment in version_git.sh re: JULIA_GIT_BRANCH
 $(BUILDDIR)/julia_version.h: $(JULIAHOME)/VERSION
 	@TMPFILE=$$(mktemp $(abspath $@.XXXXXX)); \
 	{ \
@@ -459,6 +460,13 @@ $(BUILDDIR)/julia_version.h: $(JULIAHOME)/VERSION
 		echo "#ifndef JL_VERSION_H"; \
 		echo "#define JL_VERSION_H"; \
 		echo "#define JULIA_VERSION_STRING" \"$(JULIA_VERSION)\"; \
+		echo "#define JULIA_GIT_COMMIT" \"$$(git rev-parse HEAD)\"; \
+		if [ -n "$${BUILDKITE_BRANCH}" ]; then \
+			branch="$${BUILDKITE_BRANCH}"; \
+		else \
+			branch="$$(git rev-parse --abbrev-ref HEAD)"; \
+		fi; \
+		echo "#define JULIA_GIT_BRANCH \"$$branch\""; \
 		echo $(JULIA_VERSION) | awk 'BEGIN {FS="[.,+-]"} \
 			{print "#define JULIA_VERSION_MAJOR " $$1 "\n" \
 			"#define JULIA_VERSION_MINOR " $$2 "\n" \
