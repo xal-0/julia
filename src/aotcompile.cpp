@@ -779,6 +779,7 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
     target_cgparams.sanitize_memory = jl_options.target_sanitize_memory;
     target_cgparams.sanitize_thread = jl_options.target_sanitize_thread;
     target_cgparams.sanitize_address = jl_options.target_sanitize_address;
+    target_cgparams.use_jlplt = jl_options.target_use_jlplt;
     auto &out = *data->out;
     // compile all methods for the current world and type-inference world
     DenseMap<jl_code_instance_t *, jl_code_info_t *> ci_infos;

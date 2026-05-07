@@ -73,6 +73,7 @@ struct JLOptions
     target_sanitize_memory::Int8
     target_sanitize_thread::Int8
     target_sanitize_address::Int8
+    target_use_jlplt::Int8
 end
 
 # This runs early in the sysimage != is not defined yet
