@@ -10,6 +10,10 @@
 
 #define UNAVAILABLE { jl_errorf("%s: not available in this build of Julia", __func__); }
 
+#ifdef JL_CODEGEN_FALLBACKS_STATIC
+#include "jl_static_codegen_fallbacks.inc"
+#endif
+
 JL_DLLEXPORT void jl_dump_native_fallback(void *native_code,
         const char *bc_fname, const char *unopt_bc_fname, const char *obj_fname, const char *asm_fname,
         ios_t *z, ios_t *s, jl_emission_params_t *params) UNAVAILABLE
@@ -165,3 +169,5 @@ JL_DLLEXPORT const char JLJITGetGlobalPrefix_fallback(void* JIT) UNAVAILABLE
 JL_DLLEXPORT const char *JLJITGetDataLayoutString_fallback(void* JIT) UNAVAILABLE
 
 JL_DLLEXPORT void* JLJITGetIRCompileLayer_fallback(void* JIT) UNAVAILABLE
+
+JL_DLLEXPORT void *jl_jit_abi_converter_fallback(jl_task_t *ct, jl_abi_t from_abi, jl_code_instance_t *codeinst) UNAVAILABLE
