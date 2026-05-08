@@ -167,6 +167,7 @@ void jl_gc_wait_for_the_world(jl_ptls_t* gc_all_tls_states, int gc_n_threads)
                     // If we woke up because of a timeout, print the backtrace of the straggler
                     if (ret == UV_ETIMEDOUT) {
                         jl_safe_printf("===== Thread %d failed to reach safepoint after %d seconds, printing backtrace below =====\n", ptls2->tid + 1, jl_options.timeout_for_safepoint_straggler_s);
+#ifndef JL_CODEGEN_FALLBACKS_STATIC
                         // Try to record the backtrace of the straggler using `jl_try_record_thread_backtrace`
                         jl_ptls_t ptls = jl_current_task->ptls;
                         size_t bt_size = jl_try_record_thread_backtrace(ptls2, ptls->bt_data, JL_MAX_BT_SIZE);
@@ -174,6 +175,7 @@ void jl_gc_wait_for_the_world(jl_ptls_t* gc_all_tls_states, int gc_n_threads)
                         for (size_t i = 0; i < bt_size; i += jl_bt_entry_size(ptls->bt_data + i)) {
                             jl_fprint_bt_entry_codeloc(ios_safe_stderr, ptls->bt_data + i);
                         }
+#endif
                     }
                 }
             }

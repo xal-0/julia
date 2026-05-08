@@ -591,12 +591,14 @@ static int jl_thread_suspend_and_get_state2(int tid, host_thread_state_t *ctx) J
 
 static int jl_thread_suspend_and_get_state(int tid, int timeout, bt_context_t *ctx)
 {
+#ifndef JL_DISABLE_LIBUNWIND
     (void)timeout;
     host_thread_state_t state;
     if (!jl_thread_suspend_and_get_state2(tid, &state)) {
         return 0;
     }
     *ctx = *(unw_context_t*)&state;
+#endif
     return 1;
 }
 
@@ -779,6 +781,7 @@ void jl_with_stackwalk_lock(void (*f)(void*), void *ctx)
 // assumes holding `jl_lock_profile_mach`
 void jl_profile_thread_mach(int tid)
 {
+#ifndef JL_DISABLE_LIBUNWIND
     // if there is no space left, return early
     if (jl_profile_is_buffer_full()) {
         jl_profile_stop_timer();
@@ -852,6 +855,7 @@ void jl_profile_thread_mach(int tid)
     }
     // We're done! Resume the thread.
     jl_thread_resume(tid);
+#endif
 }
 
 void *mach_profile_listener(void *arg)

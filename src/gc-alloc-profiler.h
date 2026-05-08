@@ -39,9 +39,11 @@ extern int g_alloc_profile_enabled;
 #define jl_gc_unknown_type_tag ((jl_datatype_t*)0xdeadaa03)
 
 static inline void maybe_record_alloc_to_profile(jl_value_t *val, size_t size, jl_datatype_t *typ) JL_NOTSAFEPOINT {
+#ifndef JL_CODEGEN_FALLBACKS_STATIC
     if (__unlikely(g_alloc_profile_enabled)) {
         _maybe_record_alloc_to_profile(val, size, typ);
     }
+#endif
 }
 
 #ifdef __cplusplus

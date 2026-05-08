@@ -1173,12 +1173,13 @@ static void *signal_listener(void *arg)
             }
         }
 
-        signal_bt_size = 0;
 #if !defined(JL_DISABLE_LIBUNWIND)
+        signal_bt_size = 0;
         if (critical) {
             do_critical_profile();
         }
         else if (profile) {
+#ifndef JL_DISABLE_LIBUNWIND
             if (profile_all_tasks) {
                 // Don't take the stackwalk lock here since it's already taken in `jl_rec_backtrace`
                 jl_profile_task();
@@ -1186,6 +1187,7 @@ static void *signal_listener(void *arg)
             else {
                 do_profile();
             }
+#endif
         }
 #ifndef HAVE_MACH
         if (profile_running) {
@@ -1209,7 +1211,11 @@ static void *signal_listener(void *arg)
             // also let's make sure we're not in the middle of GC.
             jl_atomic_fetch_add(&jl_gc_disable_counter, 1);
             jl_safepoint_wait_gc(NULL);
+#ifdef JL_DISABLE_LIBUNWIND
+            jl_exit_thread0(sig, NULL, 0);
+#else
             jl_exit_thread0(sig, signal_bt_data, signal_bt_size);
+#endif
         }
         else if (critical) {
             // critical in this case actually means SIGINFO request
@@ -1225,9 +1231,11 @@ static void *signal_listener(void *arg)
 
             jl_safe_printf("\nsignal (%d): %s\n", sig, strsignal(sig));
             size_t i;
+#ifndef JL_DISABLE_LIBUNWIND
             for (i = 0; i < signal_bt_size; i += jl_bt_entry_size(signal_bt_data + i)) {
                 jl_fprint_bt_entry_codeloc(ios_safe_stderr, signal_bt_data + i);
             }
+#endif
             jl_safe_printf("\n");
             // Enable trace compilation to stderr with timing during profile collection
             jl_force_trace_compile_timing_enable();
