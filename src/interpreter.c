@@ -891,6 +891,9 @@ jl_value_t *NOINLINE jl_interpret_toplevel_thunk(jl_module_t *m, jl_code_info_t 
 // which should instead be handled in lowering
 jl_value_t *NOINLINE jl_interpret_toplevel_expr_in(jl_module_t *m, jl_value_t *e, jl_code_info_t *src, jl_svec_t *sparam_vals)
 {
+#ifdef JL_CODEGEN_FALLBACKS_STATIC
+    return NULL;
+#endif
     interpreter_state *s;
     jl_value_t **locals;
     JL_GC_PUSHFRAME(s, locals, 0);

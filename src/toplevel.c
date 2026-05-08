@@ -608,6 +608,10 @@ static jl_value_t *jl_eval_toplevel_stmts(jl_module_t *JL_NONNULL m, jl_array_t 
 
 JL_DLLEXPORT jl_value_t *jl_toplevel_eval_flex(jl_module_t *JL_NONNULL m, jl_value_t *e, int fast, int expanded, const char **toplevel_filename, int *toplevel_lineno)
 {
+#ifdef JL_CODEGEN_FALLBACKS_STATIC
+    return NULL;
+#endif
+
     jl_task_t *ct = jl_current_task;
     if (jl_is_globalref(e)) {
         return jl_eval_globalref((jl_globalref_t*)e, ct->world_age);

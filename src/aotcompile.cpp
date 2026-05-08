@@ -989,7 +989,7 @@ static GlobalVariable *emit_ptls_table(Module &M, Type *T_size, Type *T_ptr) {
     std::array<Constant *, 3> ptls_table{
         new GlobalVariable(M, T_ptr, false, GlobalValue::ExternalLinkage, emit_pgcstack_default_func(M, T_ptr), "jl_pgcstack_func_slot"),
         new GlobalVariable(M, T_size, false, GlobalValue::ExternalLinkage, Constant::getNullValue(T_size), "jl_pgcstack_key_slot"),
-        new GlobalVariable(M, T_size, false, GlobalValue::ExternalLinkage, Constant::getNullValue(T_size), "jl_tls_offset"),
+        new GlobalVariable(M, T_size, false, GlobalValue::ExternalLinkage, Constant::getNullValue(T_size), "jl_tls_offset_local"),
     };
     for (auto &gv : ptls_table) {
         cast<GlobalVariable>(gv)->setVisibility(GlobalValue::HiddenVisibility);
@@ -2181,7 +2181,7 @@ void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fname,
 
             // let the compiler know we are going to internalize a copy of this,
             // if it has a current usage with ExternalLinkage
-            auto jl_small_typeof_copy = dataM.getGlobalVariable("jl_small_typeof");
+            auto jl_small_typeof_copy = dataM.getGlobalVariable("jl_small_typeof_local");
             if (jl_small_typeof_copy) {
                 jl_small_typeof_copy->setVisibility(GlobalValue::HiddenVisibility);
                 jl_small_typeof_copy->setDSOLocal(true);
@@ -2261,7 +2261,7 @@ void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fname,
             auto jl_small_typeof_copy = new GlobalVariable(metadataM, AT, false,
                                                         GlobalVariable::ExternalLinkage,
                                                         Constant::getNullValue(AT),
-                                                        "jl_small_typeof");
+                                                        "jl_small_typeof_local");
             jl_small_typeof_copy->setVisibility(GlobalValue::HiddenVisibility);
             jl_small_typeof_copy->setDSOLocal(true);
 

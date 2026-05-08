@@ -208,7 +208,7 @@ extern _Atomic(int) jl_uv_n_waiters;
 // Global data structures for accessing symbols and other globals
 #include "jl_internal_data.inc"
 
-#if defined(__clang_analyzer__)
+#if defined(__clang_analyzer__) || defined(JL_CODEGEN_FALLBACKS_STATIC)
 #define XX(name, type) extern JL_HIDDEN type jl_##name JL_GLOBALLY_ROOTED;
 JL_INTERNAL_DATA(XX)
 #undef XX

@@ -23,7 +23,7 @@ _Atomic(jl_value_t*) cmpswap_names JL_GLOBALLY_ROOTED;
 jl_datatype_t *ijl_small_typeof[(jl_max_tags << 4) / sizeof(*ijl_small_typeof)]; // 16-bit aligned, like the GC
 
 // Global data structures for accessing symbols and other globals
-#if !defined(__clang_analyzer__)
+#if !defined(__clang_analyzer__) && !defined(JL_CODEGEN_FALLBACKS_STATIC)
 struct jl_sysimg_global sysimg_global;
 struct jl_const_globals const_globals;
 struct jl_internal_global internal_global;
@@ -3944,7 +3944,9 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_module_type->isidentityfree = 1;
 
     export_jl_small_typeof();
+#ifndef JL_CODEGEN_FALLBACKS_STATIC
     export_jl_sysimg_globals();
+#endif
 }
 
 static jl_value_t *core(const char *name)

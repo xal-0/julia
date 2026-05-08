@@ -7,7 +7,7 @@ let
 
     SparseArrays = find_loaded_root_module(Base.PkgId(
         Base.UUID("2f01184e-e22b-5df5-ae63-d93ebab69eaf"), "SparseArrays"))
-    if SparseArrays !== nothing
+    if SparseArrays !== nothing && Base.USE_GPL_LIBS
         @eval SparseArrays.CHOLMOD begin
             function __init__()
                 ccall((:SuiteSparse_config_malloc_func_set, :libsuitesparseconfig),
@@ -53,7 +53,7 @@ let
         Base.UUID("44cfe95a-1eb2-52ea-b672-e2afdf69b78f"), "Pkg"))
     if Pkg !== nothing
         @eval Pkg begin
-            __init__() = nothing # Assume the Pkg is not actually used
+            __init__() = nothing
         end
     end
 
@@ -61,7 +61,7 @@ let
         Base.UUID("f489334b-da3d-4c2e-b8f0-e476e12c162b"), "StyledStrings"))
     if StyledStrings !== nothing
         @eval StyledStrings begin
-            __init__() = nothing # Assume that StyledStrings are not actually used
+            __init__() = nothing
         end
     end
 
@@ -69,7 +69,7 @@ let
         Base.UUID("d6f4376e-aef5-505a-96c1-9c027394607a"), "Markdown"))
     if Markdown !== nothing
         @eval Markdown begin
-            __init__() = nothing # Assume that Markdown is not actually used with StyledStrings
+            __init__() = nothing
         end
     end
 
@@ -77,7 +77,17 @@ let
         Base.UUID("ac6e5ff7-fb65-4e79-a425-ec3bc9c03011"), "JuliaSyntaxHighlighting"))
     if JuliaSyntaxHighlighting !== nothing
         @eval JuliaSyntaxHighlighting begin
-            __init__() = nothing # Assume the JuliaSyntaxHighlighting is not actually used with StyledStrings
+            __init__() = nothing
         end
     end
+
+    # Libdl = find_loaded_root_module(Base.PkgId(
+    #     Base.UUID("8f399da3-3557-5675-b5ff-fb832c97cbdb"), "Libdl"))
+    # Core.println("Libdl: ", Libdl)
+    # if Libdl !== nothing
+    #     @eval Libdl begin
+    #         __init__() = nothing
+    #         const private_shlibdir = () -> nothing
+    #     end
+    # end
 end

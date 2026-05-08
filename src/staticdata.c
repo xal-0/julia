@@ -3528,6 +3528,8 @@ JL_DLLEXPORT void jl_image_unpack_zstd(void *handle, jl_image_buf_t *image)
 // From a shared library handle, verify consistency and return a jl_image_buf_t
 static jl_image_buf_t get_image_buf(void *handle, int is_pkgimage)
 {
+#ifndef JL_CODEGEN_FALLBACKS_STATIC
+
     // verify that the linker resolved the symbols in this image against ourselves (libjulia-internal)
     void** (*get_jl_RTLD_DEFAULT_handle_addr)(void) = NULL;
     if (handle != jl_RTLD_DEFAULT_handle) {
@@ -3535,7 +3537,21 @@ static jl_image_buf_t get_image_buf(void *handle, int is_pkgimage)
         if (!symbol_found || (void*)&jl_RTLD_DEFAULT_handle != (get_jl_RTLD_DEFAULT_handle_addr()))
             jl_error("Image file failed consistency check: maybe opened the wrong version?");
     }
+#endif
 
+#ifdef JL_CODEGEN_FALLBACKS_STATIC
+    extern jl_image_pointers_t jl_image_pointers;
+    extern char jl_system_image_data;
+    extern intptr_t jl_system_image_size;
+    jl_image_buf_t image = {
+        .kind = JL_IMAGE_KIND_SO,
+        .pointers = &jl_image_pointers,
+        .data = &jl_system_image_data,
+        .size = jl_system_image_size,
+        .base = 0,
+    };
+    return image;
+#else
     jl_image_unpack_func_t **unpack;
     jl_image_buf_t image = {
         .kind = JL_IMAGE_KIND_SO,
@@ -3550,13 +3566,9 @@ static jl_image_buf_t get_image_buf(void *handle, int is_pkgimage)
         // in the usual case, the sysimage was not statically linked to libjulia-internal
         // look up the external sysimage symbols via the dynamic linker
         jl_dlsym(handle, "jl_image_unpack", (void **)&unpack, 1, 0);
+        (*unpack)(handle, &image);
     }
-    else {
-        // the sysimage was statically linked directly against libjulia-internal
-        // use the internal symbols
-        unpack = &jl_image_unpack;
-    }
-    (*unpack)(handle, &image);
+#endif
 
 #ifdef _OS_WINDOWS_
     image.base = (intptr_t)handle;
@@ -3787,7 +3799,9 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         JL_SMALL_TYPEOF(XX)
 #undef XX
         export_jl_small_typeof();
+#ifndef JL_CODEGEN_FALLBACKS_STATIC
         export_jl_sysimg_globals();
+#endif
         jl_global_roots_list = (jl_genericmemory_t*)jl_read_value(&s);
         jl_global_roots_keyset = (jl_genericmemory_t*)jl_read_value(&s);
         s.ptls->root_task->tls = jl_read_value(&s);

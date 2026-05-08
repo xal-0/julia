@@ -81,7 +81,11 @@ JL_DLLEXPORT void jl_init_with_image_handle(void *handle) {
     const char *image_path = jl_pathname_for_handle(handle);
     jl_options.image_file = image_path;
 
+#ifdef JL_CODEGEN_FALLBACKS_STATIC
+    jl_resolve_sysimg_location(JL_IMAGE_IN_MEMORY, NULL);
+#else
     jl_resolve_sysimg_location(JL_IMAGE_JULIA_HOME, NULL);
+#endif
     jl_image_buf_t sysimage = jl_set_sysimg_so(handle);
 
     jl_init_(sysimage);
@@ -540,6 +544,15 @@ JL_DLLEXPORT void jl_sigatomic_end(void)
 JL_DLLEXPORT int jl_is_debugbuild(void) JL_NOTSAFEPOINT
 {
 #ifdef JL_DEBUG_BUILD
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+JL_DLLEXPORT int jl_is_staticbuild(void) JL_NOTSAFEPOINT
+{
+#ifdef JL_CODEGEN_FALLBACKS_STATIC
     return 1;
 #else
     return 0;

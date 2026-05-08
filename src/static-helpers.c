@@ -3,9 +3,11 @@
 #include "../cli/loader.h"
 #include "../cli/jl_exports.h"
 
-JL_DLLEXPORT const char * jl_get_libdir(void)
+void *jl_method_table;
+
+JL_DLLEXPORT const char *jl_get_libdir(void)
 {
-    abort();
+  return "TODO";
 }
 
 #endif

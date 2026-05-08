@@ -1044,7 +1044,7 @@ static inline jl_value_t *jl_to_typeof(uintptr_t t)
 
 #define jl_tuple_type jl_anytuple_type
 
-#if !defined(JL_LIBRARY_EXPORTS_INTERNAL) || defined(__clang_analyzer__)
+#if !defined(JL_LIBRARY_EXPORTS_INTERNAL) || defined(__clang_analyzer__) || defined(JL_CODEGEN_FALLBACKS_STATIC)
 #define XX(name, type) extern JL_DLLIMPORT type jl_##name JL_GLOBALLY_ROOTED;
 JL_EXPORTED_DATA_POINTERS(XX)
 #undef XX

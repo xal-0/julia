@@ -97,6 +97,9 @@ void write_srctext(ios_t *f, jl_array_t *udeps, int64_t srctextpos) {
 
 JL_DLLEXPORT void jl_write_compiler_output(void)
 {
+#ifdef JL_CODEGEN_FALLBACKS_STATIC
+    return;
+#endif
     if (!jl_generating_output()) {
         return;
     }

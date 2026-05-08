@@ -893,6 +893,9 @@ JL_DLLEXPORT jl_value_t *jl_copy_ast(jl_value_t *expr)
 
 JL_DLLEXPORT int jl_is_operator(const char *sym)
 {
+#ifdef JL_CODEGEN_FALLBACKS_STATIC
+    return 0;
+#endif
     jl_ast_context_t *ctx = jl_ast_ctx_enter(NULL);
     fl_context_t *fl_ctx = &ctx->fl;
     int res = fl_applyn(fl_ctx, 1, symbol_value(symbol(fl_ctx, "operator?")), symbol(fl_ctx, sym)) == fl_ctx->T;
@@ -902,6 +905,9 @@ JL_DLLEXPORT int jl_is_operator(const char *sym)
 
 JL_DLLEXPORT int jl_is_unary_operator(const char *sym)
 {
+#ifdef JL_CODEGEN_FALLBACKS_STATIC
+    return 0;
+#endif
     jl_ast_context_t *ctx = jl_ast_ctx_enter(NULL);
     fl_context_t *fl_ctx = &ctx->fl;
     int res = fl_applyn(fl_ctx, 1, symbol_value(symbol(fl_ctx, "unary-op?")), symbol(fl_ctx, sym)) == fl_ctx->T;
@@ -911,6 +917,9 @@ JL_DLLEXPORT int jl_is_unary_operator(const char *sym)
 
 JL_DLLEXPORT int jl_is_unary_and_binary_operator(const char *sym)
 {
+#ifdef JL_CODEGEN_FALLBACKS_STATIC
+    return 0;
+#endif
     jl_ast_context_t *ctx = jl_ast_ctx_enter(NULL);
     fl_context_t *fl_ctx = &ctx->fl;
     int res = fl_applyn(fl_ctx, 1, symbol_value(symbol(fl_ctx, "unary-and-binary-op?")), symbol(fl_ctx, sym)) == fl_ctx->T;
@@ -920,6 +929,9 @@ JL_DLLEXPORT int jl_is_unary_and_binary_operator(const char *sym)
 
 JL_DLLEXPORT int jl_is_syntactic_operator(const char *sym)
 {
+#ifdef JL_CODEGEN_FALLBACKS_STATIC
+    return 0;
+#endif
     jl_ast_context_t *ctx = jl_ast_ctx_enter(NULL);
     fl_context_t *fl_ctx = &ctx->fl;
     int res = fl_applyn(fl_ctx, 1, symbol_value(symbol(fl_ctx, "syntactic-op?")), symbol(fl_ctx, sym)) == fl_ctx->T;
@@ -929,6 +941,9 @@ JL_DLLEXPORT int jl_is_syntactic_operator(const char *sym)
 
 JL_DLLEXPORT int jl_operator_precedence(const char *sym)
 {
+#ifdef JL_CODEGEN_FALLBACKS_STATIC
+    return 0;
+#endif
     jl_ast_context_t *ctx = jl_ast_ctx_enter(NULL);
     fl_context_t *fl_ctx = &ctx->fl;
     int res = numval(fl_applyn(fl_ctx, 1, symbol_value(symbol(fl_ctx, "operator-precedence")), symbol(fl_ctx, sym)));

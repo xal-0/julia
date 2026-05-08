@@ -809,7 +809,20 @@ static jl_cgval_t emit_cglobal(jl_codectx_t &ctx, jl_value_t **args, size_t narg
         res = sym.jl_ptr;
     }
     else if (sym.f_name_expr != NULL) {
-        res = runtime_sym_lookup(ctx, sym, ctx.f);
+        if (!ctx.params->use_jlplt) {
+            if ((sym.f_lib && !((sym.f_lib == JL_EXE_LIBNAME) ||
+                  (sym.f_lib == JL_LIBJULIA_INTERNAL_DL_LIBNAME) ||
+                  (sym.f_lib == JL_LIBJULIA_DL_LIBNAME))) || sym.f_lib_expr) {
+                // n.b. this is not semantically valid, but use_jlplt=1 when semantic correctness is desired
+                emit_error(ctx, "cglobal: Had library expression, but symbol lookup was disabled");
+            }
+            if (sym.f_name == nullptr)
+                emit_error(ctx, "cglobal: Had name expression, but symbol lookup was disabled");
+            res = jl_Module->getOrInsertGlobal(sym.f_name, getInt8Ty(ctx.builder.getContext()));
+        }
+        else {
+            res = runtime_sym_lookup(ctx, sym, ctx.f);
+        }
     }
     else {
         // Fall back to runtime intrinsic
