@@ -69,6 +69,10 @@
 typedef struct _jl_taggedvalue_t jl_taggedvalue_t;
 typedef struct _jl_tls_states_t *jl_ptls_t;
 
+#ifdef JL_CODEGEN_FALLBACKS_STATIC
+#define JL_DISABLE_LIBUNWIND
+#endif
+
 #ifdef JL_LIBRARY_EXPORTS
 #include "uv.h"
 #endif

@@ -1142,6 +1142,7 @@ extern bt_context_t *jl_to_bt_context(void *sigctx) JL_NOTSAFEPOINT;
 // it and attempting to return normally.
 int jl_simulate_longjmp(jl_jmp_buf mctx, bt_context_t *c) JL_NOTSAFEPOINT
 {
+#ifndef JL_DISABLE_LIBUNWIND
 #if (defined(_COMPILER_ASAN_ENABLED_) || defined(_COMPILER_TSAN_ENABLED_))
     // https://github.com/llvm/llvm-project/blob/main/compiler-rt/lib/hwasan/hwasan_interceptors.cpp
     return 0;
@@ -1439,6 +1440,7 @@ int jl_simulate_longjmp(jl_jmp_buf mctx, bt_context_t *c) JL_NOTSAFEPOINT
 #else
 return 0;
 #endif
+#endif
 }
 
 JL_DLLEXPORT size_t jl_try_record_thread_backtrace(jl_ptls_t ptls2, jl_bt_element_t *bt_data, size_t max_bt_size) JL_NOTSAFEPOINT
@@ -1460,6 +1462,7 @@ JL_DLLEXPORT size_t jl_try_record_thread_backtrace(jl_ptls_t ptls2, jl_bt_elemen
 
 JL_DLLEXPORT jl_record_backtrace_result_t jl_record_backtrace(jl_task_t *t, jl_bt_element_t *bt_data, size_t max_bt_size, int all_tasks_profiler) JL_NOTSAFEPOINT
 {
+#ifndef JL_DISABLE_LIBUNWIND
     int16_t tid = INT16_MAX;
     jl_record_backtrace_result_t result = {0, tid};
     jl_task_t *ct = NULL;
@@ -1525,6 +1528,8 @@ JL_DLLEXPORT jl_record_backtrace_result_t jl_record_backtrace(jl_task_t *t, jl_b
     result.bt_size = bt_size;
     result.tid = old;
     return result;
+#endif
+    abort();
 }
 
 //--------------------------------------------------
