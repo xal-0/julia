@@ -71,7 +71,7 @@ Instruction *LowerPTLS::emit_pgcstack_tp(Value *offset, Instruction *insertBefor
 {
     IRBuilder<> builder(insertBefore);
     Value *tls;
-    if (TargetTriple.isX86() && insertBefore->getFunction()->callsFunctionThatReturnsTwice()) {
+    if (0 && TargetTriple.isX86() && insertBefore->getFunction()->callsFunctionThatReturnsTwice()) {
         // Workaround LLVM bug by hiding the offset computation
         // (and therefore the optimization opportunity) from LLVM.
         // Ref https://github.com/JuliaLang/julia/issues/17288
