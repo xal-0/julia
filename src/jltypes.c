@@ -1728,7 +1728,9 @@ jl_value_t *jl_substitute_datatype(jl_value_t *t, jl_datatype_t * x, jl_datatype
                 vals[i_firstnewparam] = firstnewparam;
             }
             for (size_t i = i_firstnewparam+1; i < nparams; i++) { // insert the remaining parameters
-                vals[i] = jl_substitute_datatype(jl_svecref(typ->parameters, i), x, y);
+                // jl_substitute_datatype may trigger GC, after which sv is no
+                // longer fresh, so the store needs a write barrier.
+                jl_svecset(sv, i, jl_substitute_datatype(jl_svecref(typ->parameters, i), x, y));
             }
             if (jl_is_tuple_type(wrapper)) {
                 // special case for tuples, since the wrapper (Tuple) does not have as

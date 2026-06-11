@@ -588,6 +588,7 @@ JL_DLLEXPORT jl_code_instance_t *jl_get_method_inferred(
                 if (!(debuginfo == NULL && jl_atomic_cmpswap_relaxed(&codeinst->debuginfo, &debuginfo, di)))
                     if (!(debuginfo && jl_egal((jl_value_t*)debuginfo, (jl_value_t*)di)))
                         continue;
+                jl_gc_wb(codeinst, di);
             }
             // TODO: this is implied by the matching worlds, since it is intrinsic, so do we really need to verify it?
             jl_svec_t *e = jl_atomic_load_relaxed(&codeinst->edges);
@@ -743,6 +744,7 @@ JL_DLLEXPORT void jl_fill_codeinst(
     }
     jl_atomic_store_relaxed(&codeinst->ipo_purity_bits, effects);
     codeinst->analysis_results = analysis_results;
+    jl_gc_wb(codeinst, analysis_results);
     assert(jl_atomic_load_relaxed(&codeinst->min_world) == 1);
     assert(jl_atomic_load_relaxed(&codeinst->max_world) == 0);
     jl_atomic_store_release(&codeinst->inferred, jl_nothing);
