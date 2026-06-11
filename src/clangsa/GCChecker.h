@@ -58,6 +58,7 @@ const VarRegion *walk_back_to_global_VR(const MemRegion *Region);
 class GCChecker
     : public Checker<
           eval::Call,
+          eval::Assume,
           check::BeginFunction,
           check::EndFunction,
           check::PostCall,
@@ -137,6 +138,34 @@ public:
                                         bool isFunctionSafepoint);
   };
 
+  // A store of a GC pointer into a heap object for which the required write
+  // barrier (jl_gc_wb and friends) has not been seen yet.
+  struct WriteBarrierObligation {
+    const Stmt *StoreStmt;
+    const LocationContext *LCtx;
+    SVal ChildVal;
+
+    WriteBarrierObligation() : StoreStmt(nullptr), LCtx(nullptr),
+                               ChildVal(UnknownVal()) {}
+    WriteBarrierObligation(const Stmt *S, const LocationContext *L,
+                           SVal Child)
+        : StoreStmt(S), LCtx(L), ChildVal(Child) {}
+
+    bool operator==(const WriteBarrierObligation &Other) const {
+      return StoreStmt == Other.StoreStmt && LCtx == Other.LCtx &&
+             ChildVal == Other.ChildVal;
+    }
+    bool operator!=(const WriteBarrierObligation &Other) const {
+      return !(*this == Other);
+    }
+
+    void Profile(llvm::FoldingSetNodeID &ID) const {
+      ID.AddPointer(StoreStmt);
+      ID.AddPointer(LCtx);
+      ChildVal.Profile(ID);
+    }
+  };
+
 private:
   template <typename callback>
   static bool isJuliaType(callback f, QualType QT) {
@@ -192,8 +221,17 @@ private:
                                          const MemRegion *Region);
   static GCObjectSet getObjectsOwningRegion(const ProgramStateRef &State,
                                             const MemRegion *Region);
+  enum class ParentLookup {
+    // Also fall back to walking the region's value chain to a rooted symbol.
+    IncludeValueChain,
+    // Only structural sub-region and recorded ownership edges.
+    Structural,
+  };
   static GCObjectSet getTrackedParentObjects(const ProgramStateRef &State,
-                                             const MemRegion *Region);
+                                             const MemRegion *Region,
+                                             ParentLookup Lookup =
+                                                 ParentLookup::
+                                                     IncludeValueChain);
   static GCObjectSet
   getObjectsForRegionOrParents(const ProgramStateRef &State,
                                const MemRegion *Region);
@@ -285,6 +323,7 @@ private:
                                             GCObjectSet Objects);
 
   static bool isGCTrackedType(QualType Type);
+  static bool isPseudoTrackedType(QualType Type);
   static bool isGenericMemoryRefType(QualType Type);
   static const FieldDecl *getGenericMemoryRefMemField(QualType Type);
   static bool isGCObjectType(QualType Type);
@@ -303,6 +342,15 @@ private:
                                         const SourceManager &SM);
   static const SourceManager &getSM(CheckerContext &C) { return C.getSourceManager(); }
   bool isSafepoint(const CallEvent &Call, CheckerContext &C) const;
+  static bool isWriteBarrierFunction(StringRef Name);
+  bool isValueFromGloballyRootedGlobal(SymbolRef Sym) const;
+  ProgramStateRef recordWriteBarrierObligation(ProgramStateRef State, SVal LVal,
+                                               SVal RVal, const Stmt *S,
+                                               CheckerContext &C) const;
+  bool processWriteBarrierDischarge(const CallEvent &Call, CheckerContext &C,
+                                    ProgramStateRef &State) const;
+  bool reportPendingWriteBarrier(CheckerContext &C, ProgramStateRef State,
+                                 StringRef Message) const;
   bool processPotentialSafepoint(const CallEvent &Call, CheckerContext &C,
                                  ProgramStateRef &State) const;
   bool processRootPropagatingRegionResult(const CallEvent &Call,
@@ -327,6 +375,8 @@ public:
   void checkBeginFunction(CheckerContext &Ctx) const;
   void checkEndFunction(const clang::ReturnStmt *RS, CheckerContext &Ctx) const;
   bool evalCall(const CallEvent &Call, CheckerContext &C) const;
+  ProgramStateRef evalAssume(ProgramStateRef State, SVal Cond,
+                             bool Assumption) const;
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
   void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
   void checkPostStmt(const CStyleCastExpr *CE, CheckerContext &C) const;
@@ -444,6 +494,26 @@ using GCPermanentRootRegionsTy = llvm::ImmutableSet<const MemRegion *>;
 // Root regions whose updates must keep old bindings as an over-approximation.
 class GCConservativeRootRegions {};
 using GCConservativeRootRegionsTy = llvm::ImmutableSet<const MemRegion *>;
+// Objects known to be young because they were allocated since the most recent
+// safepoint. Stores into these objects do not require a write barrier
+// (the jl_gc_wb_fresh rule). The set is cleared at every safepoint, since
+// surviving a collection may promote an object to the old generation.
+class GCFreshObjects {};
+using GCFreshObjectsTy = llvm::ImmutableSet<GCChecker::GCObject>;
+// Objects known to be permanently allocated (jl_gc_permobj and friends) and
+// therefore always in the old generation: storing them into another object
+// never creates an old-to-young edge.
+class GCKnownOldObjects {};
+using GCKnownOldObjectsTy = llvm::ImmutableSet<GCChecker::GCObject>;
+// Symbols constrained on the current path to equal a globally rooted value
+// (e.g. after `if (ftypes == jl_emptysvec)`), and therefore old.
+class GCOldSymbols {};
+using GCOldSymbolsTy = llvm::ImmutableSet<SymbolRef>;
+// Stores of GC pointers into heap objects whose write barrier has not been
+// seen yet, keyed by the stored-into (parent) object.
+class GCPendingWriteBarriers {};
+using GCPendingWriteBarriersTy =
+    llvm::ImmutableMap<GCChecker::GCObject, GCChecker::WriteBarrierObligation>;
 
 } // namespace jl_gc_checker
 
@@ -470,6 +540,10 @@ JL_GC_DECLARE_PROGRAMSTATE_TRAIT(GCObjectOwnershipMap)
 JL_GC_DECLARE_PROGRAMSTATE_TRAIT(GCRootFrameMap)
 JL_GC_DECLARE_PROGRAMSTATE_TRAIT(GCPermanentRootRegions)
 JL_GC_DECLARE_PROGRAMSTATE_TRAIT(GCConservativeRootRegions)
+JL_GC_DECLARE_PROGRAMSTATE_TRAIT(GCFreshObjects)
+JL_GC_DECLARE_PROGRAMSTATE_TRAIT(GCKnownOldObjects)
+JL_GC_DECLARE_PROGRAMSTATE_TRAIT(GCOldSymbols)
+JL_GC_DECLARE_PROGRAMSTATE_TRAIT(GCPendingWriteBarriers)
 
 #undef JL_GC_DECLARE_PROGRAMSTATE_TRAIT
 

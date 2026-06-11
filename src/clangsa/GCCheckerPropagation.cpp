@@ -250,6 +250,15 @@ void GCChecker::checkEndFunction(const clang::ReturnStmt *RS,
   unsigned CurrentDepth = C.getState()->get<GCDepth>();
   if (CurrentDepth != 0) {
     report_error(C, "Non-popped GC frame present at end of function");
+    return;
+  }
+  // A JL_NOTSAFEPOINT function may legally defer the write barrier to its
+  // caller, since no collection can run before the function returns.
+  if (gcEnabledHere(State) && !isFDAnnotatedNotSafepoint(FD, getSM(C))) {
+    reportPendingWriteBarrier(
+        C, State,
+        "Reached end of function with a heap store missing its write barrier "
+        "(jl_gc_wb)");
   }
 }
 
@@ -567,6 +576,317 @@ bool GCChecker::isSafepoint(const CallEvent &Call, CheckerContext &C) const {
   return isCalleeSafepoint;
 }
 
+bool GCChecker::isWriteBarrierFunction(StringRef Name) {
+  return Name == "jl_gc_wb" ||
+         Name == "jl_gc_wb_back" ||
+         Name == "jl_gc_wb_fresh" ||
+         Name == "jl_gc_wb_knownold" ||
+         Name == "jl_gc_wb_current_task" ||
+         Name == "jl_gc_multi_wb" ||
+         Name == "jl_gc_wb_genericmemory_copy_ptr" ||
+         Name == "jl_gc_wb_genericmemory_copy_boxed" ||
+         Name == "jl_gc_queue_root" ||
+         Name == "jl_gc_queue_multiroot";
+}
+
+// Types in the GC-tracked list that are never heap-allocated Julia objects:
+// stack rooting contexts, by-value carriers, and storage with special-purpose
+// rooting in the runtime (exception stacks of the running task). Stores into
+// these never require a write barrier.
+bool GCChecker::isPseudoTrackedType(QualType QT) {
+  return isJuliaType(
+      [](StringRef Name) {
+        return Name.ends_with_insensitive("jl_ircode_state") ||
+               Name.ends_with_insensitive("typemap_intersection_env") ||
+               Name.ends_with_insensitive("interpreter_state") ||
+               Name.ends_with_insensitive("jl_typeenv_t") ||
+               Name.ends_with_insensitive("jl_stenv_t") ||
+               Name.ends_with_insensitive("set_world") ||
+               Name.ends_with_insensitive("egal_set") ||
+               Name.ends_with_insensitive("jl_cgval_t") ||
+               Name.ends_with_insensitive("jl_codectx_t") ||
+               Name.ends_with_insensitive("jl_codegen_params_t") ||
+               Name.ends_with_insensitive("jl_ast_context_t") ||
+               Name.ends_with_insensitive("jl_ordereddict_t") ||
+               Name.ends_with_insensitive("jl_genericmemoryref_t") ||
+               Name.ends_with_insensitive("jl_excstack_t");
+      },
+      QT);
+}
+
+// Values loaded from JL_GLOBALLY_ROOTED globals (type objects, jl_emptysvec,
+// ...) live in the system image or were permanently allocated during
+// bootstrap, so treat them as old for write-barrier purposes.
+bool GCChecker::isValueFromGloballyRootedGlobal(SymbolRef Sym) const {
+  if (!Sym)
+    return false;
+  if (isGloballyRootedType(Sym->getType()))
+    return true;
+  const VarRegion *GlobalVR =
+      Helpers::walk_back_to_global_VR(Sym->getOriginRegion());
+  if (!GlobalVR)
+    return false;
+  const VarDecl *VD = GlobalVR->getDecl();
+  const FieldDecl *GlobalField = nullptr;
+  for (const MemRegion *Cur = Sym->getOriginRegion(); Cur;) {
+    if (const auto *FR = Cur->getAs<FieldRegion>()) {
+      GlobalField = FR->getDecl();
+      break;
+    }
+    const auto *SR = Cur->getAs<SubRegion>();
+    if (!SR)
+      break;
+    Cur = SR->getSuperRegion();
+  }
+  return declHasAnnotation(VD, "julia_globally_rooted") ||
+         isGloballyRootedType(VD->getType()) ||
+         (GlobalField &&
+          (declHasAnnotation(GlobalField, "julia_globally_rooted") ||
+           isGloballyRootedType(GlobalField->getType())));
+}
+
+ProgramStateRef
+GCChecker::recordWriteBarrierObligation(ProgramStateRef State, SVal LVal,
+                                        SVal RVal, const Stmt *S,
+                                        CheckerContext &C) const {
+  const MemRegion *R = LVal.getAsRegion();
+  if (!R)
+    return State;
+  R = R->StripCasts();
+  // The stored value must be a pointer to a GC-tracked object. Constants and
+  // non-Loc values are NULL, small-integer type tags, or other integer-derived
+  // values, never young heap pointers.
+  if (RVal.isConstant() || !RVal.getAs<Loc>())
+    return State;
+  QualType StoredType;
+  if (const auto *TVR = R->getAs<TypedValueRegion>())
+    StoredType = getAtomicValueType(TVR->getValueType());
+  SymbolRef ValSym = RVal.getAsSymbol(true);
+  if (StoredType.isNull() && ValSym)
+    StoredType = getAtomicValueType(ValSym->getType());
+  if (StoredType.isNull() || !isGCObjectType(StoredType))
+    return State;
+  // Objects of globally rooted types (e.g. jl_sym_t) are permanently
+  // allocated and therefore never young, so storing them requires no barrier.
+  if (isGloballyRootedType(StoredType))
+    return State;
+  if (ValSym && isGloballyRootedType(ValSym->getType()))
+    return State;
+  if (isValueFromGloballyRootedGlobal(ValSym))
+    return State;
+  // Stored values constrained equal to a globally rooted value on this path
+  // are old as well.
+  if (ValSym && State->contains<GCOldSymbols>(ValSym))
+    return State;
+  // The store target must be storage inside a heap-allocated object: a
+  // sub-region of a symbolic base. Stores to locals, globals, GC frame slots,
+  // and alloca-backed buffers never need a write barrier.
+  const MemRegion *Base = R->getBaseRegion();
+  const SymbolicRegion *SymBase = Base->getAs<SymbolicRegion>();
+  if (!SymBase)
+    return State;
+  // The pointer the store goes through must itself reference GC-managed
+  // memory. This keeps out stores into foreign memory that happens to be
+  // reachable from a GC object (e.g. ptls->current_task) and into stack
+  // rooting contexts that the checker pseudo-tracks.
+  QualType BaseType = SymBase->getSymbol()->getType();
+  if (!isGCTrackedType(BaseType) || isPseudoTrackedType(BaseType))
+    return State;
+  if (isAllocaDerivedRegion(State, Base))
+    return State;
+  if (isRootingRegion(State, R))
+    return State;
+  // If the pointer the store goes through was itself loaded from a field of a
+  // struct that is not a GC-tracked heap type (e.g. the jl_value_t** slot
+  // pointers held in subtyping's stack bookkeeping structs), the target is
+  // not memory owned by a heap object.
+  {
+    SymbolRef BaseSym = SymBase->getSymbol();
+    while (const auto *SCast = dyn_cast<SymbolCast>(BaseSym))
+      BaseSym = SCast->getOperand();
+    auto fieldRecordIsUntracked = [&](const FieldDecl *Field) {
+      const RecordDecl *RD = Field->getParent();
+      if (!RD || !RD->getTypeForDecl())
+        return false;
+      QualType RecordType(RD->getTypeForDecl(), 0);
+      return !isGCTrackedType(RecordType) || isPseudoTrackedType(RecordType);
+    };
+    for (const MemRegion *Cur = BaseSym->getOriginRegion(); Cur;) {
+      if (const auto *FR = Cur->getAs<FieldRegion>()) {
+        if (fieldRecordIsUntracked(FR->getDecl()))
+          return State;
+        break;
+      }
+      // A store through a caller-provided slot pointer (a T** parameter such
+      // as smallintset's pcache): the slot's owner is not knowable locally,
+      // and the corresponding write barrier is the caller's contract.
+      if (const auto *VR = Cur->getAs<VarRegion>()) {
+        const auto *PVD = dyn_cast<ParmVarDecl>(VR->getDecl());
+        if (PVD && PVD->getType()->isPointerType() &&
+            isGCObjectType(
+                getAtomicValueType(PVD->getType()->getPointeeType())))
+          return State;
+        break;
+      }
+      const auto *SR = Cur->getAs<SubRegion>();
+      if (!SR)
+        break;
+      Cur = SR->getSuperRegion();
+    }
+    // Conjured pointers carry no origin region, but record the load
+    // expression they were conjured for.
+    if (const auto *SConj = dyn_cast<SymbolConjured>(BaseSym)) {
+      const auto *E = dyn_cast_or_null<Expr>(SConj->getStmt());
+      if (E) {
+        if (const auto *ME = dyn_cast<MemberExpr>(E->IgnoreParenCasts())) {
+          if (const auto *Field = dyn_cast<FieldDecl>(ME->getMemberDecl()))
+            if (fieldRecordIsUntracked(Field))
+              return State;
+        }
+      }
+    }
+  }
+  // Use structural parent lookup only: the value-chain fallback may surface
+  // objects that the store target is merely reachable from (e.g. rooted stack
+  // slots addressed through a bookkeeping struct), not stored into.
+  GCObjectSet Candidates =
+      getTrackedParentObjects(State, R, ParentLookup::Structural);
+  if (Candidates.isEmpty())
+    return State;
+  GCObjectSet ChildObjects = getObjectsForSVal(State, RVal);
+  // Permanently allocated children are always old; no barrier required.
+  if (!ChildObjects.isEmpty()) {
+    bool AllChildrenOld = true;
+    for (GCObject Child : ChildObjects) {
+      if (!State->contains<GCKnownOldObjects>(Child)) {
+        AllChildrenOld = false;
+        break;
+      }
+    }
+    if (AllChildrenOld)
+      return State;
+  }
+  GCFreshObjectsTy Fresh = State->get<GCFreshObjects>();
+  // The candidate set over-approximates the single concrete parent. Carrier
+  // symbols of non-GC pointer types (e.g. a conjured jl_taggedvalue_t*) are
+  // not real parents, and if any remaining candidate is fresh the store may
+  // well target a young object, so demanding a barrier would over-warn.
+  GCObjectSet Parents = emptyObjectSet(State);
+  for (GCObject Parent : Candidates) {
+    QualType ParentType = getAtomicValueType(Parent->getType());
+    if (!isGCObjectType(ParentType) || isPseudoTrackedType(ParentType))
+      continue;
+    if (Fresh.contains(Parent))
+      return State;
+    if (objectSetContains(ChildObjects, Parent))
+      continue;
+    Parents = State->get_context<GCObjectSet>().add(Parents, Parent);
+  }
+  for (GCObject Parent : Parents)
+    State = State->set<GCPendingWriteBarriers>(
+        Parent, WriteBarrierObligation(S, C.getLocationContext(), RVal));
+  return State;
+}
+
+bool GCChecker::processWriteBarrierDischarge(const CallEvent &Call,
+                                             CheckerContext &C,
+                                             ProgramStateRef &State) const {
+  const FunctionDecl *FD =
+      Call.getDecl() ? Call.getDecl()->getAsFunction() : nullptr;
+  StringRef Name = FD && FD->getDeclName().isIdentifier() ? FD->getName() : "";
+  if (!isWriteBarrierFunction(Name))
+    return false;
+  GCPendingWriteBarriersTy Pending = State->get<GCPendingWriteBarriers>();
+  if (Pending.isEmpty())
+    return false;
+  GCObjectSet ParentObjects = emptyObjectSet(State);
+  if (Call.getNumArgs() >= 1)
+    ParentObjects = getObjectsForExprValue(Call.getArgExpr(0),
+                                           Call.getArgSVal(0), State, C);
+  bool Changed = false;
+  for (GCObject Parent : ParentObjects) {
+    if (State->get<GCPendingWriteBarriers>(Parent)) {
+      State = State->remove<GCPendingWriteBarriers>(Parent);
+      Changed = true;
+    }
+  }
+  if (!Changed) {
+    // The barrier's parent could not be correlated with any pending store
+    // (e.g. the parent expression and the store target were modeled as
+    // different objects); conservatively treat all pending barriers as
+    // satisfied rather than warn next to an explicit barrier.
+    for (auto I = Pending.begin(), E = Pending.end(); I != E; ++I) {
+      State = State->remove<GCPendingWriteBarriers>(I.getKey());
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
+ProgramStateRef GCChecker::evalAssume(ProgramStateRef State, SVal Cond,
+                                      bool Assumption) const {
+  // Discard barrier obligations whose stored value turns out to be NULL on
+  // this path (the write barrier for such stores is typically guarded by the
+  // same null check, and a NULL store needs no barrier), or equal to a
+  // globally rooted value and therefore old, as in
+  // `if (ftypes == jl_emptysvec) ndt->types = ftypes;`. The check must happen
+  // here, while the constraint is alive: once the symbol dies the analyzer
+  // reaps the constraint before the end of the function.
+  SymbolRef KnownOldEqualSym = nullptr;
+  if (const auto *SSE =
+          dyn_cast_or_null<SymSymExpr>(Cond.getAsSymbol())) {
+    BinaryOperator::Opcode Op = SSE->getOpcode();
+    if ((Op == BO_EQ && Assumption) || (Op == BO_NE && !Assumption)) {
+      if (isValueFromGloballyRootedGlobal(SSE->getRHS()))
+        KnownOldEqualSym = SSE->getLHS();
+      else if (isValueFromGloballyRootedGlobal(SSE->getLHS()))
+        KnownOldEqualSym = SSE->getRHS();
+    }
+  }
+  if (KnownOldEqualSym)
+    State = State->add<GCOldSymbols>(KnownOldEqualSym);
+  GCPendingWriteBarriersTy Pending = State->get<GCPendingWriteBarriers>();
+  for (auto I = Pending.begin(), E = Pending.end(); I != E; ++I) {
+    SVal Child = I.getData().ChildVal;
+    bool ChildIsOldEqual =
+        KnownOldEqualSym && Child.getAsSymbol(true) == KnownOldEqualSym;
+    if (ChildIsOldEqual || State->isNull(Child).isConstrainedTrue())
+      State = State->remove<GCPendingWriteBarriers>(I.getKey());
+  }
+  return State;
+}
+
+bool GCChecker::reportPendingWriteBarrier(CheckerContext &C,
+                                          ProgramStateRef State,
+                                          StringRef Message) const {
+  GCPendingWriteBarriersTy Pending = State->get<GCPendingWriteBarriers>();
+  if (Pending.isEmpty())
+    return false;
+  // Skip stores whose value is constrained to be NULL on this path; barriers
+  // for them are typically guarded by the same null check.
+  std::optional<WriteBarrierObligation> Chosen;
+  for (auto I = Pending.begin(), E = Pending.end(); I != E; ++I) {
+    SVal Child = I.getData().ChildVal;
+    if (State->isNull(Child).isConstrainedTrue())
+      continue;
+    Chosen = I.getData();
+    break;
+  }
+  if (!Chosen)
+    return false;
+  const WriteBarrierObligation Obligation = *Chosen;
+  report_error(
+      [&](PathSensitiveBugReport *Report) {
+        if (Obligation.StoreStmt && Obligation.LCtx)
+          Report->addNote("Tracked GC pointer store without write barrier here",
+                          PathDiagnosticLocation::createBegin(
+                              Obligation.StoreStmt, C.getSourceManager(),
+                              Obligation.LCtx));
+      },
+      C, Message);
+  return true;
+}
+
 bool GCChecker::processPotentialSafepoint(const CallEvent &Call,
                                           CheckerContext &C,
                                           ProgramStateRef &State) const {
@@ -575,6 +895,19 @@ bool GCChecker::processPotentialSafepoint(const CallEvent &Call,
   bool DidChange = false;
   if (!gcEnabledHere(C))
     return false;
+  if (reportPendingWriteBarrier(
+          C, State,
+          "Calling potential safepoint with a heap store missing its write "
+          "barrier (jl_gc_wb)"))
+    return false;
+  // Any object that survives this safepoint may be promoted to the old
+  // generation, so it is no longer exempt from write barriers.
+  GCFreshObjectsTy Fresh = State->get<GCFreshObjects>();
+  if (!Fresh.isEmpty()) {
+    State = State->set<GCFreshObjects>(
+        State->get_context<GCFreshObjects>().getEmptySet());
+    DidChange = true;
+  }
   const Decl *D = Call.getDecl();
   const FunctionDecl *FD = D ? D->getAsFunction() : nullptr;
   GCObjectSet SpeciallyRootedObjects = emptyObjectSet(State);
@@ -1048,10 +1381,26 @@ bool GCChecker::processAllocationOfResult(const CallEvent &Call,
       }
     }
   }
+  bool HadExistingState = getStateForSymbol(State, Sym).has_value();
   GCObject Object = ensureObjectForSymbol(Sym, State, C, NewVState);
   if (Object) {
     if (ResultIsPermanentRoot)
       State = addPermanentRoot(State, getObjectRegion(Object, C));
+    // A plain allocating call returns a young object; stores into it need no
+    // write barrier until the next safepoint. Results that propagate a root
+    // or alias a pre-existing object may be arbitrarily old. Permanent
+    // allocations are immediately old: they never need to be stored with a
+    // write barrier as a child, but stores into them still require one.
+    bool IsPermAlloc = FDName == "jl_gc_permobj" ||
+                       FDName == "jl_gc_perm_alloc" ||
+                       FDName == "jl_gc_permsymbol";
+    if (!C.wasInlined && !HadExistingState &&
+        RootPropagatingObjects.isEmpty()) {
+      if (IsPermAlloc)
+        State = State->add<GCKnownOldObjects>(Object);
+      else if (!ResultIsPermanentRoot && NewVState.isJustAllocated())
+        State = State->add<GCFreshObjects>(Object);
+    }
     GCObjectSet ResultObjects = singletonObjectSet(State, Object);
     if (!RootPropagatingObjects.isEmpty()) {
       State = State->set<GCObjectStateMap>(Object, NewVState);
@@ -1121,7 +1470,8 @@ bool GCChecker::processAllocationOfResult(const CallEvent &Call,
 
 void GCChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
   ProgramStateRef State = C.getState();
-  bool didChange = processArgumentRooting(Call, C, State);
+  bool didChange = processWriteBarrierDischarge(Call, C, State);
+  didChange |= processArgumentRooting(Call, C, State);
   if (!C.wasInlined)
     didChange |= processPotentialSafepoint(Call, C, State);
   didChange |= processRootPropagatingRegionResult(Call, C, State);
@@ -1751,6 +2101,8 @@ void GCChecker::checkBind(SVal LVal, SVal RVal, const clang::Stmt *S,
   if (!R) {
     return;
   }
+  State = recordWriteBarrierObligation(State, LVal, RVal, S, C);
+  bool RecordedWriteBarrier = State != C.getState();
   SymbolRef Sym = RVal.getAsSymbol(true);
   GCObjectSet RValObjects = getObjectsForSVal(State, RVal);
   auto IsConjuredCallResult = [](SymbolRef Sym) {
@@ -1812,7 +2164,7 @@ void GCChecker::checkBind(SVal LVal, SVal RVal, const clang::Stmt *S,
     }
   }
   if (!Sym) {
-    if (BoundTrackedStorage || BoundDerivedObjects)
+    if (BoundTrackedStorage || BoundDerivedObjects || RecordedWriteBarrier)
       C.addTransition(State);
     return;
   }
@@ -1821,7 +2173,7 @@ void GCChecker::checkBind(SVal LVal, SVal RVal, const clang::Stmt *S,
       C.addTransition(State);
       return;
     }
-    if (BoundTrackedStorage || BoundDerivedObjects)
+    if (BoundTrackedStorage || BoundDerivedObjects || RecordedWriteBarrier)
       C.addTransition(State);
     return;
   }

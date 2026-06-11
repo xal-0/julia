@@ -28,6 +28,10 @@ JL_GC_DEFINE_PROGRAMSTATE_TRAIT(GCObjectOwnershipMap)
 JL_GC_DEFINE_PROGRAMSTATE_TRAIT(GCRootFrameMap)
 JL_GC_DEFINE_PROGRAMSTATE_TRAIT(GCPermanentRootRegions)
 JL_GC_DEFINE_PROGRAMSTATE_TRAIT(GCConservativeRootRegions)
+JL_GC_DEFINE_PROGRAMSTATE_TRAIT(GCFreshObjects)
+JL_GC_DEFINE_PROGRAMSTATE_TRAIT(GCKnownOldObjects)
+JL_GC_DEFINE_PROGRAMSTATE_TRAIT(GCOldSymbols)
+JL_GC_DEFINE_PROGRAMSTATE_TRAIT(GCPendingWriteBarriers)
 
 #undef JL_GC_DEFINE_PROGRAMSTATE_TRAIT
 
@@ -388,7 +392,8 @@ GCChecker::getObjectsOwningRegion(const ProgramStateRef &State,
 
 GCChecker::GCObjectSet
 GCChecker::getTrackedParentObjects(const ProgramStateRef &State,
-                                   const MemRegion *Region) {
+                                   const MemRegion *Region,
+                                   ParentLookup Lookup) {
   GCObjectSet Objects = emptyObjectSet(State);
   if (!Region)
     return Objects;
@@ -426,6 +431,12 @@ GCChecker::getTrackedParentObjects(const ProgramStateRef &State,
     Cur = SR->getSuperRegion()->StripCasts();
     IsInitialRegion = false;
   }
+  // The walk below crosses pointer indirections (through derived symbols), so
+  // the resulting object may merely be reachable from the region's value
+  // chain rather than own the region's memory. Structural-only lookups skip
+  // it.
+  if (Lookup == ParentLookup::Structural)
+    return Objects;
   SymbolRef Root = walkToRoot(
       [](SymbolRef Sym, const LivenessState *OldVState) { return !OldVState; },
       State, Region);

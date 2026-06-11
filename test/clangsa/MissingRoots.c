@@ -1027,3 +1027,125 @@ JL_DLLEXPORT jl_value_t *jl_totally_used_function(int i)
     return v; // expected-warning{{Return value may have been GCed}}
               // expected-note@-1{{Return value may have been GCed}}
 }
+
+// Write barrier checking: storing a GC pointer into a heap object requires a
+// write barrier (jl_gc_wb and friends) before the next safepoint, unless the
+// stored-into object is fresh (allocated since the last safepoint) or the
+// stored value is known to be old.
+
+void write_barrier_missing(jl_method_t *m, jl_value_t *v) {
+    m->sig = v; // expected-note{{Tracked GC pointer store without write barrier here}}
+    jl_gc_safepoint(); // expected-warning{{Calling potential safepoint with a heap store missing its write barrier (jl_gc_wb)}}
+                       // expected-note@-1{{Calling potential safepoint with a heap store missing its write barrier (jl_gc_wb)}}
+}
+
+void write_barrier_present(jl_method_t *m, jl_value_t *v) {
+    m->sig = v;
+    jl_gc_wb(m, v);
+    jl_gc_safepoint();
+}
+
+// The barrier for a possibly-NULL value may be guarded by the corresponding
+// null check; a NULL store requires no barrier.
+void write_barrier_conditional(jl_method_t *m, jl_value_t *v) {
+    m->sig = v;
+    if (v)
+        jl_gc_wb(m, v);
+    jl_gc_safepoint();
+}
+
+// Fresh allocations stay young until the next safepoint (jl_gc_wb_fresh rule).
+void write_barrier_fresh_object(jl_value_t *v) {
+    jl_svec_t *s = jl_svec1(NULL);
+    jl_svec_data(s)[0] = v;
+}
+
+// After a safepoint the object may have been promoted to the old generation.
+void write_barrier_promoted_alloc(jl_value_t *v) {
+    jl_svec_t *s = NULL;
+    JL_GC_PUSH1(&s); // expected-note{{GC frame changed here}}
+    s = jl_svec1(NULL);
+    jl_gc_safepoint();
+    jl_svec_data(s)[0] = v; // expected-note{{Tracked GC pointer store without write barrier here}}
+    jl_gc_safepoint(); // expected-warning{{Calling potential safepoint with a heap store missing its write barrier (jl_gc_wb)}}
+                       // expected-note@-1{{Calling potential safepoint with a heap store missing its write barrier (jl_gc_wb)}}
+    JL_GC_POP();
+}
+
+void write_barrier_promoted_alloc_ok(jl_value_t *v) {
+    jl_svec_t *s = NULL;
+    JL_GC_PUSH1(&s);
+    s = jl_svec1(NULL);
+    jl_gc_safepoint();
+    jl_svec_data(s)[0] = v;
+    jl_gc_wb(s, v);
+    jl_gc_safepoint();
+    JL_GC_POP();
+}
+
+void write_barrier_missing_at_end(jl_method_t *m, jl_value_t *v) {
+    m->sig = v; // expected-warning{{Reached end of function with a heap store missing its write barrier (jl_gc_wb)}}
+                // expected-note@-1{{Tracked GC pointer store without write barrier here}}
+                // expected-note@-2{{Reached end of function with a heap store missing its write barrier (jl_gc_wb)}}
+}
+
+void write_barrier_back(jl_method_t *m, jl_value_t *v) {
+    m->sig = v;
+    jl_gc_wb_back(m);
+    jl_gc_safepoint();
+}
+
+void write_barrier_known_old_child(jl_method_t *m, jl_value_t *v) {
+    m->sig = v;
+    jl_gc_wb_knownold(m, v);
+    jl_gc_safepoint();
+}
+
+// Symbols are permanently allocated, so they are never young.
+void write_barrier_symbol_child(jl_typename_t *tn, jl_sym_t *name) {
+    tn->name = name;
+    jl_gc_safepoint();
+}
+
+// Values loaded from globally rooted globals live in the system image.
+void write_barrier_global_child(jl_method_t *m) {
+    m->sig = (jl_value_t*)jl_emptysvec;
+    jl_gc_safepoint();
+}
+
+void write_barrier_null_child(jl_method_t *m) {
+    m->sig = NULL;
+    jl_gc_safepoint();
+}
+
+// Permanent allocations are immediately old: storing them needs no barrier...
+void write_barrier_permobj_child(jl_ptls_t ptls, jl_datatype_t *st) {
+    st->instance = jl_gc_permobj(ptls, 0, st, 0);
+    jl_gc_safepoint();
+}
+
+// ... but storing a young value into them still does.
+void write_barrier_permobj_parent(jl_ptls_t ptls, jl_datatype_t *st, jl_value_t *v) {
+    jl_value_t *instance = jl_gc_permobj(ptls, sizeof(void*), st, 0);
+    ((jl_value_t**)instance)[0] = v; // expected-note{{Tracked GC pointer store without write barrier here}}
+    jl_gc_safepoint(); // expected-warning{{Calling potential safepoint with a heap store missing its write barrier (jl_gc_wb)}}
+                       // expected-note@-1{{Calling potential safepoint with a heap store missing its write barrier (jl_gc_wb)}}
+}
+
+// Analyzer-visible atomic stores are plain stores.
+void write_barrier_atomic_store(jl_binding_t *b, jl_value_t *v) {
+    jl_atomic_store_release(&b->value, v); // expected-note{{Tracked GC pointer store without write barrier here}}
+    jl_gc_safepoint(); // expected-warning{{Calling potential safepoint with a heap store missing its write barrier (jl_gc_wb)}}
+                       // expected-note@-1{{Calling potential safepoint with a heap store missing its write barrier (jl_gc_wb)}}
+}
+
+void write_barrier_atomic_store_ok(jl_binding_t *b, jl_value_t *v) {
+    jl_atomic_store_release(&b->value, v);
+    jl_gc_wb(b, v);
+    jl_gc_safepoint();
+}
+
+// A JL_NOTSAFEPOINT helper may defer the barrier to its caller.
+void write_barrier_notsafepoint_helper(jl_method_t *m, jl_value_t *v) JL_NOTSAFEPOINT {
+    m->sig = v;
+}

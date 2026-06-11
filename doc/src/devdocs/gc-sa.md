@@ -330,3 +330,37 @@ functions (unless it happens to decide to consider them in its analysis) and not
 running threads. As such, it may miss a few problematic cases, though in practice such concurrent
 modification is fairly rare. Improving the analyzer to handle more such cases may be an interesting
 topic for future work.
+
+## Write barrier checking
+
+In addition to rooting, the analyzer checks the generational write barrier invariant: after a
+pointer to a GC-managed object is stored into another (heap-allocated) GC-managed object, an
+appropriate write barrier (`jl_gc_wb`, `jl_gc_wb_back`, `jl_gc_multi_wb`, or one of the
+genericmemory copy barriers) must execute on the parent object before the next safepoint and
+before the end of the function.
+
+The analyzer tracks every store of a GC pointer through a heap pointer as a pending write
+barrier obligation on the stored-into (parent) object. The obligation is discharged by a call
+to one of the write barrier functions whose first argument is the same parent. If a safepoint
+is reached - or the function ends - while obligations are pending, an error is emitted.
+
+In keeping with the runtime's rules, no write barrier is required (and no obligation is
+recorded) when:
+- the parent object is *fresh*, i.e. was allocated after the most recent safepoint and is
+  therefore still in the young generation. This mirrors `jl_gc_wb_fresh`. Any safepoint ends
+  freshness, since surviving a collection may promote the object to the old generation.
+- the stored value is `NULL`, an integer (e.g. a small type tag), or known to be old:
+  permanently allocated values (`jl_gc_permobj` results, `jl_sym_t` objects) and values loaded
+  from `JL_GLOBALLY_ROOTED` globals.
+- the store target is a GC frame slot, a stack rooting context (e.g.
+  `typemap_intersection_env`), alloca-derived memory, or non-GC memory that merely happens to
+  be reachable from a GC object (e.g. through `jl_ptls_t`).
+- the stored value is constrained to be `NULL` on the current path. This permits the common
+  `x->fld = val; if (val) jl_gc_wb(x, val);` pattern.
+- the function is annotated `JL_NOTSAFEPOINT`, in which case the write barrier may be deferred
+  to the caller (the end-of-function check is skipped; the safepoint check is moot).
+
+The matching of barriers to stores is per-object rather than per-field: a barrier call whose
+parent cannot be correlated with any pending store conservatively discharges all pending
+obligations, so the checker targets entirely missing write barriers rather than mismatched
+ones.
